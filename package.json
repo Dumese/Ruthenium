@@ -1,0 +1,47 @@
+{
+  "name": "Ruthenium",
+  "private": true,
+  "version": "0.1.0-rc.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "build:e2e": "tsc --noEmit && vite build --mode e2e",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && node scripts/check-i18n.mjs && node scripts/check-i18n-usage.mjs",
+    "test:ui": "node scripts/run-ui.mjs",
+    "regress:ui": "node scripts/ui-regress.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@xterm/addon-fit": "^0.11",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-web-links": "^0.12",
+    "@xterm/addon-webgl": "^0.19",
+    "@xterm/xterm": "^6",
+    "react": "^19",
+    "react-dom": "^19",
+    "zustand": "^5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5",
+    "jsdom": "^31.0.1",
+    "ssh2": "^1.17.0",
+    "typescript": "^5",
+    "vite": "^7",
+    "vitest": "^3"
+  },
+  "license": "MIT",
+  "author": "Dumese"
+}

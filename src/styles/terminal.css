@@ -1,0 +1,181 @@
+/* terminal / SFTP / 数据页样式（tline 系列保留为规格样式） */
+/* ---------- terminal ---------- */
+.termwrap{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--term);position:relative}
+.banner{flex:none;display:flex;align-items:center;gap:9px;padding:8px 14px;background:var(--warn-bg);border-bottom:.5px solid var(--warn-line);font-size:11.5px;color:var(--orange)}
+.banner .sp{flex:1}
+.banner button{font-size:11px;padding:3px 9px;border-radius:6px;background:var(--orange);color:var(--onaccent);font-weight:550}
+.banner button.ghost{background:transparent;color:var(--t2)}
+.banner .berr{color:var(--t2);font-size:10.5px;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 连接中：spinner + 「正在连接 …」+ 取消（.connwait / .connspin） */
+.connwait{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--t2);font-size:12px}
+.connspin{width:20px;height:20px;border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent);animation:connspin .8s linear infinite}
+@keyframes connspin{to{transform:rotate(360deg)}}
+.tline{white-space:pre-wrap;word-break:break-word;min-height:1.65em}
+.tline.dim{color:var(--term-dim)}
+.tline.ok{color:var(--term-ok)}
+.tline.err{color:var(--term-err)}
+.tline .dir{color:var(--term-cmd);font-weight:600}
+.tline .muted{color:var(--term-dim)}
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;text-align:center;padding:24px}
+.empty .eicon{width:62px;height:62px;border-radius:17px;background:var(--subtle);display:flex;align-items:center;justify-content:center;color:var(--t3);margin-bottom:17px}
+.empty h2{font-size:16px;font-weight:600;letter-spacing:-.02em}
+.empty p{font-size:12px;color:var(--t2);margin-top:6px;max-width:340px;line-height:1.65}
+.empty .erow{display:flex;gap:8px;margin-top:19px}
+.empty .ehint{font-size:11px;color:var(--t3);margin-top:18px}
+.empty .ehint kbd{font-family:inherit;border:.5px solid var(--line2);border-radius:4px;padding:1px 5px;margin:0 2px}
+.termhost{flex:1;min-height:0}
+.termhost.connholder{position:absolute;inset:0;visibility:hidden;pointer-events:none}
+/* 终端留白必须挂在 .xterm 自身，不能挂在父级 .termhost：
+   FitAddon 只用「父元素高度 − .xterm 自身 padding」推算行列
+   （node_modules/@xterm/addon-fit FitAddon.ts:72-88）。留白在父级时会被当作可用高度，
+   rows/cols 偏大 → 最后一行被底部裁掉、最后一列顶到右边缘，窗口 ↔ 全屏切换
+   （尺寸变化幅度大）时最明显。.xterm-screen 是 .xterm 的普通流子元素，
+   所以 padding 会把字符网格正确地下推 / 内缩。 */
+.termhost .xterm{--termpad-t:14px;--termpad-r:18px;--termpad-b:18px;--termpad-l:18px;
+  padding:var(--termpad-t) var(--termpad-r) var(--termpad-b) var(--termpad-l);
+  height:100%;overflow:hidden}
+/* 视口（底色 + 滚动条）贴合内容区、不覆盖留白：滚动条轨道与字符网格对齐，
+   否则其顶端会比首行高出 padding-top。
+   xterm 自带 .xterm-viewport{background-color:#000} 会盖掉主题色：终端底色
+   必须走 --term 变量（颜色不得硬编码，深浅主题自动适配）。 */
+.termhost .xterm .xterm-viewport{height:auto;background-color:var(--term)!important;
+  top:var(--termpad-t);right:var(--termpad-r);bottom:var(--termpad-b);left:var(--termpad-l)}
+.termhost .xterm .xterm-screen{background-color:transparent}
+
+/* 终端内查找条：锚定在终端右上角，复用 palette 的卡片语言；不新增常驻栏。
+   有横幅（断线 / 自动重连）时下移，避免压住横幅按钮。 */
+.termfind{position:absolute;z-index:6;top:10px;right:16px;display:flex;align-items:center;gap:6px;
+  height:32px;padding:0 7px 0 9px;border-radius:9px;background:var(--card);border:.5px solid var(--line);
+  box-shadow:0 8px 24px var(--pop-shadow);color:var(--t3);animation:findIn .18s var(--ease)}
+@keyframes findIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.termwrap[data-banner="1"] .termfind{top:40px}
+.termfind .tfin{width:164px;height:24px;padding:0 7px;border-radius:6px;border:.5px solid var(--line2);
+  background:var(--input);color:var(--text);font-family:var(--termfont);font-size:11.5px}
+.termfind .tfin::placeholder{color:var(--t3)}
+.termfind .tfin:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent2);outline:0}
+.termfind .tfin.bad{border-color:var(--red);box-shadow:0 0 0 3px var(--danger-bg)}
+.termfind .tfcnt{font-size:10.5px;color:var(--t3);min-width:34px;text-align:right;
+  font-variant-numeric:tabular-nums;font-family:var(--termfont)}
+.termfind .tfcnt[data-empty="1"]{color:var(--red)}
+.termfind .tfbtn{width:22px;height:22px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;
+  color:var(--t2);font-family:var(--termfont);font-size:12px;line-height:1}
+.termfind .tfbtn:hover{background:var(--accent2);color:var(--accent)}
+
+/* ---------- SFTP ---------- */
+.sftp{flex:1;display:flex;min-height:0;flex-direction:column;container-type:inline-size}
+/* 工具栏按钮禁止收缩：窄窗收缩会先把中文压成竖排（「上/传」），再把工具栏顶出 38px 高度 */
+.sftp .toolbar > *:not(.sp){flex:none}
+/* 窄窗单栏切换（SftpView 在容器 <560px 时只渲染一侧） */
+.pane-switch{display:flex;flex:none;gap:2px;padding:2px;background:var(--subtle);border:.5px solid var(--line);border-radius:7px}
+.pane-switch button{height:19px;padding:0 8px;border-radius:5px;font-size:11px;color:var(--t2);white-space:nowrap}
+.pane-switch button.on{background:var(--card);color:var(--text);font-weight:590;box-shadow:0 1px 3px var(--seg-shadow),0 0 0 .5px var(--line)}
+/* 拖拽悬停 500ms 待切换：高亮提示「松手前会自动切到这一侧」 */
+.pane-switch button.armed{background:var(--accent2);color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+/* 单栏时主机名与状态 chip 让位（标签栏/状态栏已有），避免和切换器抢宽度 */
+.sftp.narrow .toolbar .tt,.sftp.narrow .toolbar .chip{display:none}
+/* 极窄（侧栏拖宽后）把上传/下载收成图标，保留 title 提示 */
+@container (max-width:360px){
+  .sftp .toolbar .tbtn-label{display:none}
+}
+.sftppanes{flex:1;display:flex;min-height:0}
+.pane{flex:1;min-width:0;display:flex;flex-direction:column;border-right:.5px solid var(--line)}
+.pane:last-child{border-right:0}
+.panehead{height:34px;flex:none;display:flex;align-items:center;gap:6px;padding:0 12px;border-bottom:.5px solid var(--line);font-size:11px;color:var(--t2);background:var(--subtle)}
+.panehead .ph{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.panehead .mono{font-size:10.5px}
+.crumb{display:flex;align-items:center;gap:3px;overflow:hidden;white-space:nowrap;flex:1;min-width:0}
+.crumb button{font-size:10.5px;color:var(--t2);padding:1px 3px;border-radius:4px}
+.crumb button:hover{background:var(--hover);color:var(--accent)}
+.crumb .cx{color:var(--t4)}
+/* 水平内边距 4px：文件名文字落位 = 4 + .frow 的 8 = 12px，与 .panehead/.toolbar/.queue 的左基线对齐 */
+.filelist{flex:1;overflow-y:auto;overflow-x:hidden;padding:5px 4px}
+.frow{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;font-size:11.5px;transition:background .13s}
+.frow:hover{background:var(--hover)}
+.frow.sel{background:var(--accent2)}
+.frow .fn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.frow .fs{font-size:10.5px;color:var(--t3);width:62px;text-align:right;flex:none;font-variant-numeric:tabular-nums}
+.frow .fd{font-size:10px;color:var(--t4);width:76px;text-align:right;flex:none}
+/* 权限位：等宽显示、固定宽度，右对齐到名称右侧 */
+.frow .fp{font-family:var(--termfont);font-size:10.5px;color:var(--t3);width:84px;flex:none;white-space:pre}
+.frow .fi{color:var(--t3)}
+.frow.dir .fn{color:var(--accent);font-weight:520}
+/* 窄面板按优先级给文件名让位：类型 → 大小 → 权限依次隐藏（容器查询按面板实际宽度生效，
+   侧栏宽度可拖拽，用视口断点会算错）。双栏时每栏最小 ~280px（<560 已切单栏），
+   单栏时每栏 ≈ 视口宽度，295px 下仍保留「名称 + 权限」。 */
+.pane{container-type:inline-size}
+@container (max-width:420px){ .frow .fd{display:none} }
+@container (max-width:280px){ .frow .fs{display:none} }
+@container (max-width:220px){ .frow .fp{display:none} }
+/* 原生 DnD：源行降透明；对侧面板虚线高亮；目录行实线高亮 */
+.frow[draggable="true"]{cursor:grab}
+.frow.dragging{opacity:.42}
+.pane.dragover{background:var(--drop-bg);outline:2px dashed var(--accent);outline-offset:-4px;border-radius:8px}
+.pane.dragover .filelist{background:transparent}
+.frow.dir-over{background:var(--drop-bg-strong);outline:2px solid var(--accent);outline-offset:-2px}
+.dropzone{position:fixed;z-index:60;pointer-events:none;display:none;align-items:center;justify-content:center;border:2px dashed var(--accent);background:var(--drop-bg-soft);border-radius:8px}
+.dropzone.on{display:flex}
+.dropzone.row{border-style:solid;border-width:1.5px;border-radius:6px;background:var(--drop-bg-strongest)}
+.dropzone.row .droptip{display:none}
+.droptip{background:var(--accent);color:var(--onaccent);padding:7px 14px;border-radius:8px;font-size:12px;font-weight:550;letter-spacing:.01em;box-shadow:0 8px 22px var(--seg-shadow);white-space:nowrap}
+.queue{flex:none;border-top:.5px solid var(--line);background:var(--subtle);padding:8px 12px;max-height:132px;overflow-y:auto}
+.qhead{display:flex;align-items:center;font-size:10.5px;color:var(--t2);margin-bottom:6px}
+.qhead .sp{flex:1}
+/* 传输队列：清空按钮 / 空队列提示 */
+.qclear{padding:0 6px}
+.qempty{font-size:10.5px;color:var(--t3);padding:3px 0}
+.qrow{display:flex;align-items:center;gap:8px;font-size:10.5px;padding:3px 0}
+.qrow .qn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qbar{width:110px;height:4px;border-radius:4px;background:var(--line2);overflow:hidden;flex:none}
+/* 同 .mbar：scaleX 走合成器，避免逐帧布局（高刷适配） */
+.qbar i{display:block;height:100%;background:var(--accent);border-radius:4px;transform:scaleX(var(--p,0));transform-origin:left center;will-change:transform;transition:transform .18s linear}
+.qpct{width:32px;text-align:right;color:var(--t3);font-variant-numeric:tabular-nums;flex:none}
+
+/* ---------- data page (Termius X style) ---------- */
+.datapage{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:0}
+.dphead{padding:20px 24px 14px;display:flex;align-items:flex-end;gap:12px;border-bottom:.5px solid var(--line)}
+.dphead h2{font-size:19px;font-weight:600;letter-spacing:-.025em}
+.dphead p{font-size:11.5px;color:var(--t2);margin-top:3px}
+.dphead .sp{flex:1}
+.dptable{width:100%;min-width:760px;border-collapse:collapse;font-size:12px}
+/* 窄窗：表格在自身容器内横向滚动（页头与底部卡片保持不动），滚动条可见，避免「右侧列像被裁掉」 */
+.dptable-wrap{overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+.dptable-wrap::-webkit-scrollbar{height:8px}
+.dptable-wrap::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+.dptable th{text-align:left;font-size:10.5px;color:var(--t3);font-weight:600;letter-spacing:.04em;padding:9px 14px;border-bottom:.5px solid var(--line);text-transform:uppercase;white-space:nowrap}
+.dptable td{padding:9px 14px;border-bottom:.5px solid var(--line);color:var(--t2);white-space:nowrap}
+.dptable tr:hover td{background:var(--hover)}
+/* 右键先选中目标：表格行高亮该主机（与侧栏 .hostitem.on 同一套高亮） */
+.dptable tr.on td{background:var(--accent2)}
+.dptable td.strong{color:var(--text);font-weight:540}
+/* 状态点开启时才给主机名留 7px 间距；关闭（无 .dot）时不缩进，首列与表头严格对齐 */
+.dptable td.strong .dot + span{margin-left:7px}
+/* 凭据列：只显示文件名；完整路径在 title tooltip；列宽不被撑开 */
+.dptable td.cred{max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dptable .acts{display:flex;gap:2px;justify-content:flex-end}
+.dptable .acts button{width:24px;height:24px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;color:var(--t3)}
+.dptable .acts button:hover{background:var(--active);color:var(--accent)}
+.dpgrid{padding:18px 24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.dpcard{border:.5px solid var(--line);border-radius:11px;padding:13px;background:var(--card);transition:transform .15s var(--ease),box-shadow .15s}
+.dpcard:hover{transform:translateY(-2px);box-shadow:var(--card-shadow)}
+.dpcard h4{font-size:12.5px;font-weight:590}
+.dpcard p{font-size:11px;color:var(--t2);margin-top:4px;line-height:1.55}
+.dpcard .mono{font-size:10.5px;color:var(--t3);margin-top:9px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dpcard .dprow{display:flex;gap:5px;margin-top:11px}
+
+/* ---------- 终端行号 ---------- */
+.termbody{flex:1;min-height:0;display:flex;background:var(--term)}
+.termbody .termhost{flex:1;min-width:0}
+/* 有行号栏时终端左侧内边距收紧：行号栏本身已提供视觉留白，否则左边距叠加过宽。
+   留白现在在 .xterm 上（见上），这里只改左侧那个 CSS 变量。 */
+.termbody.has-gutter .termhost .xterm{--termpad-l:6px}
+.termgutter{position:relative;flex:none;width:38px;padding:0 6px 0 0;box-sizing:border-box;text-align:right;overflow:hidden;
+  font-family:var(--termfont);font-size:calc(var(--termfs)*0.85);line-height:var(--cell-h,1.65em);
+  color:var(--term-dim);opacity:.55;user-select:none;pointer-events:none;overflow:hidden;
+  display:flex;flex-direction:column}
+.termgutter .tln{position:absolute;right:6px;white-space:pre;font-variant-numeric:tabular-nums}
+
+/* xterm 自带滚动条是 14px 覆盖层（内联样式写死宽度），压在文字右侧显得又粗又占地方。
+   这里压到 6px、圆角、随主题取色；空闲时 xterm 会自己加 .invisible 淡出，不干扰阅读。 */
+.termhost .xterm .xterm-scrollable-element > .scrollbar.vertical{width:6px!important}
+.termhost .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider{width:6px!important;border-radius:6px}
+.termhost .xterm .xterm-scrollable-element > .scrollbar.vertical > .scra{width:6px!important}

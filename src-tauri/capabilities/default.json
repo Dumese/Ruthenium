@@ -1,0 +1,26 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "最小权限：文件对话框（open）、窗口控制、系统浏览器/日志目录打开（opener）。审计 L12 移除了前端从未使用的 fs:* / clipboard-manager / os:allow-platform / dialog:allow-save；恢复相关功能时再按需加回。",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-request-user-attention",
+    "dialog:allow-open",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$LOCALDATA/Ruthenium/logs" },
+        { "path": "$LOCALDATA/Ruthenium/logs/**" }
+      ]
+    }
+  ]
+}

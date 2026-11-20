@@ -1,0 +1,106 @@
+[package]
+name = "Ruthenium"
+version = "0.1.0-rc.1"
+description = "Ruthenium — local-first lightweight SSH client"
+license = "MIT"
+authors = ["Dumese"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "ruthenium_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "net", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+keyring = "4"                       # default "v1" 含 windows-native 后端
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+# Opus 音频编码（远程桌面 P10）。
+# 注意：0.3.0-rc.0 是预发布版（audiopus 长期停留在 rc 阶段，绑定的 opus 源稳定）；
+# 发布正式版后应尽快升级，rc 期间语义化版本锁定在 Cargo.lock。
+audiopus = "0.3.0-rc.0"
+dirs = "6"
+encoding_rs = "0.8"
+portable-pty = "0.9"                # 本地终端（ConPTY on Windows）
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+# known_hosts hashed 主机名（|1|salt|hash）：HMAC-SHA1 + base64 解码。
+# 版本均复用 Cargo.lock 既有条目（russh 0.65 同栈），不引入新编译单元版本。
+base64 = "0.23"
+hmac = "0.13"
+sha1 = "0.11"
+# 密码/密钥材料的内存擦除（russh 已依赖同版本，不引入新的编译单元版本）
+zeroize = "1.9"
+# Ed25519 身份密钥生成用的 RNG 适配（rand_core 0.10 与 ssh-key 同版本，已在 Cargo.lock；
+# 0.10 没有 os_rng 特性，故用 ring 的 SystemRandom 实现 CryptoRng）
+rand_core = "0.10"
+ring = "0.17"
+
+# Windows 11 贴靠布局（snap.rs）：原生子窗口 + WM_NCHITTEST。
+# 版本对齐 Cargo.lock 里已有的 windows-sys 0.61.2（tauri/windows 同栈），
+# 不引入第二份 Win32 绑定。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",                # WNDCLASSW.hbrBackground 的 HBRUSH
+  "Win32_System_LibraryLoader",        # GetModuleHandleW
+  "Win32_UI_HiDpi",                    # GetDpiForWindow
+  "Win32_UI_Input_KeyboardAndMouse",   # TrackMouseEvent
+  "Win32_UI_WindowsAndMessaging",      # 窗口类/消息/HTMAXBUTTON
+] }
+# Windows Hello 身份验证（hello.rs）：UserConsentVerifier 走 WinRT，与 wry/tao
+# 已依赖的 windows 0.62.2 同版本，不额外引入编译单元。
+windows = { version = "0.62", features = [
+  "Foundation",                 # IAsyncOperation（阻塞等待验证结果）
+  "Security_Credentials_UI",    # UserConsentVerifier / UserConsentVerificationResult
+  "Win32_System_WinRT",         # RoInitialize（MTA 套间初始化）
+  # 远程桌面 P1 采集/编码（examples/peer_spike.rs 先行验证）：
+  "Win32_System_Com",           # CoInitializeEx
+  "Win32_System_Com_StructuredStorage", # CreateStreamOnHGlobal（GDI+ 内存 JPEG）
+  "Win32_System_DataExchange",  # 剪贴板（CF_UNICODETEXT）
+  "Win32_System_Memory",        # GlobalAlloc（剪贴板写入）
+  "Win32_System_Ole",           # CF_UNICODETEXT / VARIANT
+  "Win32_System_Variant",       # ICodecAPI 参数（VARIANT）
+  "Win32_Media_MediaFoundation", # H.264 编码（MFT）
+  "Win32_Media_Audio",          # WASAPI loopback 采集
+  "Graphics_Capture",           # 窗口共享（WinRT Graphics Capture）
+  "Graphics_DirectX",           # DirectXPixelFormat
+  "Graphics_DirectX_Direct3D11",# IDirect3DDevice / IDirect3DSurface
+  "Win32_System_WinRT_Graphics_Capture", # GraphicsCaptureItemInterop
+  "Win32_System_WinRT_Direct3D11",       # IDirect3DDxgiInterfaceAccess
+  "Win32_Graphics_Dxgi",        # IDXGIOutput1::DuplicateOutput
+  "Win32_Graphics_Dxgi_Common", # DXGI_FORMAT / SAMPLE_DESC
+  "Win32_Graphics_Gdi",         # DXGI_OUTPUT_DESC.Monitor（HMONITOR）→ CreateForMonitor
+  "Win32_Graphics_Direct3D",    # D3D_DRIVER_TYPE / FEATURE_LEVEL
+  "Win32_Graphics_Direct3D11",  # D3D11CreateDevice / 纹理映射
+  "Win32_Graphics_GdiPlus",     # GDI+ JPEG 编码（零新增依赖）
+  "Win32_Networking_WinSock",   # SOCKADDR_IN（发现层广播地址）
+  "Win32_NetworkManagement_IpHelper", # GetAdaptersAddresses
+  "Win32_NetworkManagement_Ndis",     # GetAdaptersAddresses 的类型依赖
+  "Win32_Security_Cryptography",      # DPAPI（身份密钥的 keyring 回退）
+] }
+# Windows Hello 的 IAsyncOperation / AsyncStatus 在 windows-future（windows 0.62 的
+# 异步类型拆到了单独 crate；版本与 windows 依赖树一致，不新增编译单元）。
+windows-future = "0.3"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
+[profile.release]
+strip = true
+lto = true

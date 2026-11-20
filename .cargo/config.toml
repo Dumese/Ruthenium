@@ -1,0 +1,18 @@
+# Cargo 全局配置（仅影响本仓库构建）
+#
+# 为什么需要这条 link-arg：
+# - `rfd`（经 `tauri-plugin-dialog`）静态导入 `comctl32!TaskDialogIndirect`，它是
+#   Common-Controls **v6** 才有的入口；没有 v6 manifest 时进程加载即
+#   `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`。
+# - 应用 bin 由 tauri-build 的 resource.lib 自带 manifest，没问题；
+#   但 `cargo test --lib` 的单测 harness 是 `kind=Lib + test`，**不会**应用
+#   build.rs 的 `cargo:rustc-link-arg-tests`（那条只覆盖 `tests/` 集成测试），
+#   于是 clean 构建后 `cargo test --lib` 会直接启动失败。
+# - 这里对所有最终链接补一条 manifest 依赖。link.exe 会把与 tauri 资源清单中
+#   完全相同的 dependency 合并为一条（链接后 exe 内仍只有 1 个依赖项），
+#   因此对正式包无副作用。
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C",
+  "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'",
+]

@@ -1,0 +1,19 @@
+/* reset / 滚动条 / reduced-motion / transparency —— Windows 版 */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+/* React 挂载点必须继承满高：.app{height:100%} 的父级是 #root，缺这一行时
+   侧栏内容一多就会把状态栏顶出视口。 */
+#root{height:100%}
+/* 内嵌 Noto Sans CJK 子集字体栈（styles/fonts.css）；不加 -webkit-font-smoothing（Windows 上会变细、与 ClearType 不一致） */
+body{font-family:var(--uifont);background:var(--page);color:var(--text);font-size:13px;line-height:1.5;transition:background-color .3s var(--ease),color .3s var(--ease)}
+button,input,select,textarea{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+input,textarea{outline:none}
+svg{display:block;flex:none}
+.mono{font-family:var(--termfont)}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border-radius:9px;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background:var(--scroll-thumb-hover);background-clip:padding-box}
+::-webkit-scrollbar-track{background:transparent}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+@media (prefers-reduced-transparency:reduce){.titlebar,.sidebar,.tabbar,.statusbar{backdrop-filter:none;-webkit-backdrop-filter:none;background:var(--card)}}

@@ -1,0 +1,12 @@
+# 锁定工具链（rustup 管理时自动生效；CI 与本机构建行为一致）。
+#
+# 为什么固定 rustfmt：rustfmt 的默认风格随版本演进（如 1.10 相对 1.7 改了
+# import 排序与链式调用折行），不锁定时同一份代码在不同机器上 `cargo fmt --check`
+# 会得到不同结论。固定 channel 后，所有人（含 CI）用同一份 rustfmt 产出同一格式。
+#
+# 版本策略：跟随团队当前实际使用的 stable 大版本；升级时作为一个独立 PR
+# （更新此文件 → 全量 `cargo fmt` → `cargo test`），不与功能改动混在一起。
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"          # rustfmt / clippy 按需由 rustup component 补齐
+components = ["rustfmt", "clippy"]
