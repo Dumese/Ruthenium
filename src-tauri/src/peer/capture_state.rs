@@ -14,7 +14,7 @@ pub enum CaptureState {
     Retrying,
     /// 当前输入桌面不是 Default：UAC / 锁屏 / 登录界面。
     SecureDesktop,
-    /// 采集目标（窗口共享目标或前台窗口）启用了 WDA 防截屏。
+    /// 窗口共享的采集目标启用了 WDA 防截屏（整屏共享不受影响）。
     ProtectedWindow,
     /// 疑似独占全屏：前台是全屏 D3D 应用，且画面冻结/变黑/复制反复丢失。
     ExclusiveFullscreen,
@@ -72,7 +72,7 @@ pub enum GrabOutcome {
 #[derive(Debug, Clone)]
 pub struct Observation {
     pub desktop: DesktopProbe,
-    /// 采集目标是否启用防截屏（窗口共享目标，或整屏共享时的前台窗口）。
+    /// 采集目标是否启用防截屏（仅窗口共享的目标；整屏共享恒为 false）。
     pub protected: bool,
     /// 前台是否为全屏 D3D 应用（`QUNS_RUNNING_D3D_FULL_SCREEN`）。
     pub d3d_fullscreen: bool,
@@ -292,16 +292,7 @@ pub fn probe_desktop() -> DesktopProbe {
     }
 }
 
-/// 前台窗口是否启用了 WDA 防截屏（整屏共享时用于提示）。
-#[cfg(windows)]
-pub fn probe_foreground_protected() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
-    let hwnd = unsafe { GetForegroundWindow() };
-    probe_window_protected(hwnd.0 as usize as u64)
-}
-
-/// 指定窗口是否启用了 WDA 防截屏（窗口共享时用于判定与提示）。
+/// 指定窗口是否启用了 WDA 防截屏（仅窗口共享时用于判定与提示）。
 #[cfg(windows)]
 pub fn probe_window_protected(hwnd: u64) -> bool {
     use windows::Win32::Foundation::HWND;
@@ -340,11 +331,6 @@ pub fn probe_desktop() -> DesktopProbe {
         kind: DesktopKind::Unknown,
         name: String::new(),
     }
-}
-
-#[cfg(not(windows))]
-pub fn probe_foreground_protected() -> bool {
-    false
 }
 
 #[cfg(not(windows))]
@@ -501,7 +487,6 @@ mod tests {
             desktop.kind,
             DesktopKind::Default | DesktopKind::Secure | DesktopKind::Unknown
         ));
-        let _ = probe_foreground_protected();
         let _ = probe_window_protected(0);
         let _ = probe_d3d_fullscreen();
     }

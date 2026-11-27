@@ -1942,6 +1942,9 @@ fn emit_cursor(
 }
 
 /// 上报采集状态变化：只在变化时发一条控制消息，避免静止画面也刷屏。
+///
+/// 只在采集线程调用；状态变化很稀少，用阻塞发送保证不丢——`try_send` 在控制
+/// 队列满时会把「恢复 live」丢掉，查看端会一直挂着过期警告。
 fn report_capture_state(tx: &mpsc::Sender<serde_json::Value>, change: &capture_state::StateChange) {
     applog!(
         "[peer-screen] 采集状态: {} -> {}（{}）",
@@ -1949,11 +1952,16 @@ fn report_capture_state(tx: &mpsc::Sender<serde_json::Value>, change: &capture_s
         change.to.as_str(),
         change.detail
     );
-    let _ = tx.try_send(serde_json::json!({
-        "type": "captureState",
-        "state": change.to.as_str(),
-        "detail": change.detail,
-    }));
+    if tx
+        .blocking_send(serde_json::json!({
+            "type": "captureState",
+            "state": change.to.as_str(),
+            "detail": change.detail,
+        }))
+        .is_err()
+    {
+        applog!("[peer-screen] 采集状态上报失败（控制通道已关闭）");
+    }
 }
 
 /// 喂一次健康观测并上报变化，返回状态机当前状态。
@@ -2214,12 +2222,15 @@ async fn run_stream(
             // 采集健康探测：桌面 / 受保护窗口 / 全屏 D3D 每 200ms 刷新一次，
             // 避免每个采集循环都调系统 API。
             let mut desktop_probe = capture_state::probe_desktop();
-            let mut protected = capture_state::probe_foreground_protected();
+            // 只有窗口共享才把目标窗口的 WDA 当作暂停条件；整屏共享时前台窗口
+            // 受保护只影响该窗口自身区域，暂停整条流会让其余桌面也看不到。
+            let mut protected = false;
             let mut d3d_fullscreen = capture_state::probe_d3d_fullscreen();
             let mut probe_at = Instant::now();
             let mut health = capture_state::HealthTracker::new();
-            // 窗口共享的目标句柄；桌面共享时为 None。
+            // 窗口共享的目标句柄与标题；桌面共享时为 None。
             let mut window_hwnd: Option<u64> = None;
+            let mut window_title: Option<String> = None;
 
             let (w0, h0) = source.size();
             let _ = ctrl_tx.try_send(stream_msg_json("jpeg", fps, 0, w0, h0, None));
@@ -2254,6 +2265,7 @@ async fn run_stream(
                         Ok(ClientCmd::Monitor { index }) => {
                             monitor = index;
                             window_hwnd = None;
+                            window_title = None;
                             probe_at = Instant::now() - Duration::from_millis(200);
                             // 同一进程对同一显示器只允许一份桌面复制：
                             // 必须先释放旧采集，否则重建会拿到 E_INVALIDARG。
@@ -2350,6 +2362,7 @@ async fn run_stream(
                             Ok(s) => {
                                 source = s;
                                 window_hwnd = Some(hwnd);
+                                window_title = title.clone();
                                 probe_at = Instant::now() - Duration::from_millis(200);
                                 last_hash = 0;
                                 force_key = true;
@@ -2393,6 +2406,7 @@ async fn run_stream(
                                 Ok(s) => {
                                     source = s;
                                     window_hwnd = None;
+                                    window_title = None;
                                     probe_at = Instant::now() - Duration::from_millis(200);
                                     last_hash = 0;
                                     force_key = true;
@@ -2493,7 +2507,8 @@ async fn run_stream(
                     desktop_probe = capture_state::probe_desktop();
                     protected = match window_hwnd {
                         Some(hwnd) => capture_state::probe_window_protected(hwnd),
-                        None => capture_state::probe_foreground_protected(),
+                        // 整屏共享不因前台窗口的 WDA 暂停：它只影响该窗口区域。
+                        None => false,
                     };
                     d3d_fullscreen = capture_state::probe_d3d_fullscreen();
                     probe_at = Instant::now();
@@ -2519,22 +2534,50 @@ async fn run_stream(
                     );
                     if state != before {
                         if before == capture_state::CaptureState::SecureDesktop {
-                            // 安全桌面恢复后 duplication 已失效：先释放再重建。
+                            // 安全桌面恢复后采集接口已失效：先释放，再按原采集源重建。
+                            // 窗口共享必须优先回到原窗口，否则会静默扩大成整屏。
                             source.release();
-                            match Source::desktop(monitor) {
-                                Ok(c) => {
-                                    source = c;
-                                    window_hwnd = None;
+                            let rebuilt = window_hwnd.and_then(|hwnd| match Source::window(hwnd) {
+                                Ok(s) => Some(s),
+                                Err(e) => {
+                                    applog!("[peer-screen] 安全桌面恢复后重建共享窗口失败: {e}");
+                                    None
+                                }
+                            });
+                            match rebuilt {
+                                Some(s) => {
+                                    source = s;
                                     last_hash = 0;
                                     force_key = true;
+                                    cursor_hash = 0;
                                     let _ = ctrl_tx.try_send(serde_json::json!({
                                         "type": "source",
-                                        "source": "desktop",
+                                        "source": "window",
+                                        "title": window_title.clone(),
                                         "reason": "安全桌面恢复后重建采集",
                                     }));
                                 }
-                                Err(e) => {
-                                    applog!("[peer-screen] 安全桌面恢复后重建采集失败: {e}");
+                                None => {
+                                    window_hwnd = None;
+                                    window_title = None;
+                                    match Source::desktop(monitor) {
+                                        Ok(c) => {
+                                            source = c;
+                                            last_hash = 0;
+                                            force_key = true;
+                                            cursor_hash = 0;
+                                            let _ = ctrl_tx.try_send(serde_json::json!({
+                                                "type": "source",
+                                                "source": "desktop",
+                                                "reason": "安全桌面恢复后重建采集",
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            applog!(
+                                                "[peer-screen] 安全桌面恢复后重建采集失败: {e}"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -2731,6 +2774,7 @@ async fn run_stream(
                                 Ok(c) => {
                                     source = c;
                                     window_hwnd = None;
+                                    window_title = None;
                                     last_hash = 0;
                                     force_key = true;
                                     let _ = ctrl_tx.try_send(serde_json::json!({
