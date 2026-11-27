@@ -7,6 +7,8 @@
 //! 安全边界：
 //! - 持久授权 `grant_clipboard`（默认关）+ 屏幕查看会话令牌（随机 UUID）；
 //! - 只搬运格式字节：**不渲染 HTML、不解析 RTF、不自动拉取任何外链**；
+//! - 写入本机剪贴板前统一清洗：HTML 按白名单去脚本/链接/图片/属性并限 1 MiB，
+//!   RTF 含 `\objdata`/`\pict` 等内嵌对象或图片时整段丢弃（方案 §4.5）；
 //! - 单格式原始字节 ≤ 24 MiB、本地读取总量 ≤ 32 MiB，超限丢弃该格式（文本优先保留）；
 //! - 线上单帧上限经 `caps` 协商：双方都声明 `rich` 时 32 MiB，否则按旧版 16 MiB；
 //! - 查看端默认不同步：用户在工具栏显式开启本次会话的剪贴板通道后才可拉取/发送；
@@ -19,6 +21,7 @@
 //!   `caps`/`maxPayload`；旧查看端只读 `text`，不受影响。
 //! - `get` 可带 `formats: ["text","html","rtf","png","dib"]`；响应仍以顶层 `text`
 //!   为准，可选格式放在 `formats` 对象：文本类为 UTF-8 字符串，图片类为 base64。
+//!   文本被协议上限截断时响应带 `truncated: true`，查看端据此提示用户。
 //! - `set` 保留顶层 `text`（纯文本），新增 `formats`；旧被控端只落文本，新被控端
 //!   写全部格式。
 //! - `formats.text` 与顶层 `text` 等价；本实现发送时省略它以免大文本占两倍带宽，
@@ -50,6 +53,8 @@ const MIN_PAYLOAD: usize = 64 * 1024;
 const MAX_FORMAT_BYTES: usize = 24 * 1024 * 1024;
 /// 本地一次读取/写入的所有格式原始字节总和上限。
 const MAX_LOCAL_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// HTML 写入本机剪贴板前的字节上限（超出整段丢弃，不截断 HTML）。
+const MAX_HTML_BYTES: usize = 1024 * 1024;
 /// `hello.caps` 里声明的富格式能力标识。
 const CAP_RICH: &str = "rich";
 /// 协议格式名（顺序即优先级：text 最高，dib 最低）。
@@ -119,6 +124,14 @@ pub struct ClipboardRich {
     /// DIB 原始字节的 base64。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dib: Option<String>,
+    /// 该内容来自对端且文本因协议上限被截断（仅读取结果使用；写入时忽略）。
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+/// `skip_serializing_if` 用的布尔判断（serde 传入引用）。
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ClipboardRich {
@@ -130,7 +143,13 @@ impl ClipboardRich {
             rtf: content.rtf.clone().filter(|s| !s.is_empty()),
             png: content.png.as_deref().filter(|b| !b.is_empty()).map(b64),
             dib: content.dib.as_deref().filter(|b| !b.is_empty()).map(b64),
+            truncated: false,
         }
+    }
+
+    /// 是否包含文本之外的可选格式（不含 `truncated` 元数据）。
+    fn has_optional_formats(&self) -> bool {
+        self.html.is_some() || self.rtf.is_some() || self.png.is_some() || self.dib.is_some()
     }
 
     /// 校验并转换为内部内容；超限或非法 base64 返回面向用户的中文错误。
@@ -199,6 +218,9 @@ pub struct ClipboardStart {
     /// 远端当前剪贴板的富格式（旧被控端 / 空剪贴板时省略；文本已合并进 `text`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formats: Option<ClipboardRich>,
+    /// 远端文本是否因协议 payload 上限被截断。
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /* ---------------- 大小裁剪与格式选择（纯函数，便于单测） ---------------- */
@@ -280,6 +302,128 @@ fn log_dropped(dropped: &[&'static str], reason: &str) {
     }
 }
 
+/* ---------------- 写入本机剪贴板前的富格式清洗 ---------------- */
+
+/// 允许保留的 HTML 标签：只保留排版，不含链接、图片、脚本、样式表与
+/// iframe 等可携带外部内容或执行逻辑的元素；属性一律不保留。
+const HTML_ALLOWED_TAGS: [&str; 28] = [
+    "b", "strong", "i", "em", "u", "s", "strike", "del", "ins", "sub", "sup", "p", "br", "ul",
+    "ol", "li", "blockquote", "code", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "span", "div",
+    "hr",
+];
+
+/// RTF 中可携带 OLE 对象或位图数据的 destination 控制词。
+const RTF_DROP_DESTINATIONS: [&str; 6] = [
+    "objdata",
+    "pict",
+    "object",
+    "datastore",
+    "themedata",
+    "colorschememapping",
+];
+
+/// HTML 白名单清洗：去掉脚本/样式/链接/图片及所有属性，只保留排版标签。
+///
+/// 只用于「写入本机剪贴板」：远端 HTML 会被粘贴方应用解析，必须按方案
+/// §4.5 的边界处理。清洗后超过 [`MAX_HTML_BYTES`] 时整段丢弃。
+fn sanitize_html(html: &str) -> Option<String> {
+    if html.len() > MAX_HTML_BYTES {
+        applog!(
+            "[peer] 剪贴板 HTML 超过 {} KiB，已丢弃",
+            MAX_HTML_BYTES / 1024
+        );
+        return None;
+    }
+    let tags: std::collections::HashSet<&str> = HTML_ALLOWED_TAGS.into_iter().collect();
+    // 不保留任何属性：排除 on*、style、href/src 等可携带行为或外部请求的入口。
+    let attrs: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
+    let cleaned = ammonia::Builder::default()
+        .tags(tags)
+        .tag_attributes(attrs)
+        .generic_attributes(std::collections::HashSet::new())
+        .link_rel(None)
+        .url_relative(ammonia::UrlRelative::Deny)
+        .clean(html)
+        .to_string();
+    if cleaned.len() > MAX_HTML_BYTES {
+        applog!(
+            "[peer] 剪贴板 HTML 清洗后仍超过 {} KiB，已丢弃",
+            MAX_HTML_BYTES / 1024
+        );
+        return None;
+    }
+    if cleaned.trim().is_empty() {
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// RTF 是否包含内嵌对象/图片 destination。
+///
+/// 按控制词扫描，跳过 `\\`、`\{`、`\}`、`\'hh` 转义，避免把正文里的
+/// 反斜杠误判成控制词。
+fn rtf_has_embedded_object(rtf: &str) -> bool {
+    let bytes = rtf.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let Some(&next) = bytes.get(i + 1) else { break };
+        if next == b'\\' || next == b'{' || next == b'}' {
+            i += 2;
+            continue;
+        }
+        if next == b'\'' {
+            i += 4;
+            continue;
+        }
+        if !next.is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+            end += 1;
+        }
+        let word = &bytes[start..end];
+        if RTF_DROP_DESTINATIONS
+            .iter()
+            .any(|drop| word.eq_ignore_ascii_case(drop.as_bytes()))
+        {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+/// RTF 清洗：含内嵌对象/图片时整段禁用，否则保留原始排版字节。
+///
+/// 方案 §4.5 允许「只提取文本或整段禁用」；这里选后者，避免自己实现
+/// `\objdata` / `\pict` 的二进制边界解析。纯排版 RTF（加粗、颜色等）
+/// 不含这些 destination，可以原样保留。
+fn sanitize_rtf(rtf: &str) -> Option<String> {
+    if rtf_has_embedded_object(rtf) {
+        applog!("[peer] 剪贴板 RTF 含内嵌对象或图片，已整段丢弃");
+        return None;
+    }
+    Some(rtf.to_string())
+}
+
+/// 写入本机剪贴板前统一清洗富格式（网络接收与 IPC 写入共用）。
+pub(crate) fn sanitize_content(content: &mut ClipContent) {
+    if let Some(html) = content.html.take() {
+        content.html = sanitize_html(&html);
+    }
+    if let Some(rtf) = content.rtf.take() {
+        content.rtf = sanitize_rtf(&rtf);
+    }
+}
+
 /* ---------------- 线上 formats 对象 <-> 内部内容 ---------------- */
 
 /// 内容 → 线上 `formats` 对象（不含 text：顶层 `text` 已承载，避免大文本双倍占带宽）。
@@ -334,25 +478,32 @@ fn parse_formats(obj: &Value) -> ClipContent {
             "PNG",
             map.get("png").and_then(Value::as_str).map(str::to_string),
         )
-        .unwrap_or(None),
+        .unwrap_or_else(|e| {
+            applog!("[peer] 剪贴板 PNG 字段非法或超限，已丢弃: {e}");
+            None
+        }),
         dib: decode_binary(
             "DIB",
             map.get("dib").and_then(Value::as_str).map(str::to_string),
         )
-        .unwrap_or(None),
+        .unwrap_or_else(|e| {
+            applog!("[peer] 剪贴板 DIB 字段非法或超限，已丢弃: {e}");
+            None
+        }),
     };
     let (limited, dropped) = apply_limits(content.clone(), MAX_FORMAT_BYTES, MAX_LOCAL_TOTAL_BYTES);
-    // 只对因「总量」被丢的格式记日志：parse_formats 里的 decode_binary 已经
-    // 单独记过非法/超限的图片字段，这里再记一次会重复。
+    // 文本/HTML/RTF 的单格式超限也在这里被丢弃，一并记录。
     if limited.total_bytes() != content.total_bytes() {
-        log_dropped(&dropped, "超过总大小上限");
+        log_dropped(&dropped, "超过大小上限");
     }
     content = limited;
     content
 }
 
 /// 从 `type:"text"` 应答解析内容：顶层 `text` 优先，`formats` 提供可选格式。
-fn content_from_text_response(v: &Value) -> ClipContent {
+///
+/// 返回 `(内容, 文本是否被截断)`；`truncated` 由被控端在响应里显式标记。
+fn content_from_text_response(v: &Value) -> (ClipContent, bool) {
     let mut content = ClipContent::default();
     if let Some(text) = v
         .get("text")
@@ -371,9 +522,13 @@ fn content_from_text_response(v: &Value) -> ClipContent {
         content.png = parsed.png;
         content.dib = parsed.dib;
     }
+    let truncated = v
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let (content, dropped) = apply_limits(content, MAX_FORMAT_BYTES, MAX_LOCAL_TOTAL_BYTES);
-    log_dropped(&dropped, "超过总大小上限");
-    content
+    log_dropped(&dropped, "超过大小上限");
+    (content, truncated)
 }
 
 /// 把文本截断到 `max_payload` 的 JSON 应答预算内（保留 UTF-8 字符边界）。
@@ -416,10 +571,14 @@ fn text_response(id: u64, content: &ClipContent, rich: bool, max_payload: usize)
     log_dropped(&dropped, "超过大小上限");
     let text = content.text.clone().unwrap_or_default();
     let fitted = fit_text_to_payload(&text, id, max_payload);
-    if fitted.len() != text.len() {
+    let truncated = fitted.len() != text.len();
+    if truncated {
         applog!("[peer] 剪贴板文本超过协议 payload 上限，已截断");
     }
     let mut response = serde_json::json!({ "type": "text", "id": id, "text": fitted });
+    if truncated {
+        response["truncated"] = Value::Bool(true);
+    }
     if !rich {
         return response;
     }
@@ -710,7 +869,9 @@ impl ClipboardManager {
     }
 
     /// 拉取对端剪贴板；`rich=true` 时请求全部可选格式。
-    async fn get(&self, id: &str, rich: bool) -> Result<ClipContent, String> {
+    ///
+    /// 返回 `(内容, 文本是否被截断)`。
+    async fn get(&self, id: &str, rich: bool) -> Result<(ClipContent, bool), String> {
         let Some((_, peer_rich)) = self.session_params(id).await else {
             return Err("剪贴板通道已关闭".to_string());
         };
@@ -794,7 +955,7 @@ impl ClipboardManager {
     pub async fn get_text(&self, id: &str) -> Result<String, String> {
         self.get(id, false)
             .await
-            .map(|content| content.text.unwrap_or_default())
+            .map(|(content, _)| content.text.unwrap_or_default())
     }
 
     /// 写入对端剪贴板文本（旧命令 `peer_clipboard_set` 用）。
@@ -811,7 +972,7 @@ impl ClipboardManager {
     }
 
     /// 拉取对端剪贴板富格式（新命令 `peer_clipboard_get_rich` 用）。
-    pub(crate) async fn get_rich(&self, id: &str) -> Result<ClipContent, String> {
+    pub(crate) async fn get_rich(&self, id: &str) -> Result<(ClipContent, bool), String> {
         self.get(id, true).await
     }
 
@@ -921,7 +1082,7 @@ pub async fn open(
         read_frame(&mut rd, MAX_PAYLOAD_RICH),
     )
     .await;
-    let (initial, peer_rich, max_payload) = match ack {
+    let (initial, initial_truncated, peer_rich, max_payload) = match ack {
         Ok(Some(body)) => {
             let v: Value = serde_json::from_slice(&body).unwrap_or_default();
             if v.get("type").and_then(Value::as_str) != Some("text") {
@@ -946,7 +1107,8 @@ pub async fn open(
             } else {
                 MAX_PAYLOAD_LEGACY
             };
-            (content_from_text_response(&v), peer_rich, max_payload)
+            let (content, truncated) = content_from_text_response(&v);
+            (content, truncated, peer_rich, max_payload)
         }
         Ok(None) => {
             return Err(AppError::EPeerNotAllowed(
@@ -1037,14 +1199,14 @@ pub async fn open(
         if peer_rich { "富格式" } else { "仅文本" },
         text_len
     );
+    // 顶层 text 已经承载文本，formats 里不再重复放一份，避免大文本在 IPC 中翻倍。
+    let mut formats = ClipboardRich::from_content(&initial);
+    formats.text = None;
     Ok(ClipboardStart {
         id,
         text: initial.text.clone().unwrap_or_default(),
-        formats: if peer_rich {
-            Some(ClipboardRich::from_content(&initial))
-        } else {
-            None
-        },
+        formats: (peer_rich && formats.has_optional_formats()).then_some(formats),
+        truncated: initial_truncated,
     })
 }
 
@@ -1227,8 +1389,8 @@ mod platform {
     use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
 
     use super::{
-        apply_limits, build_html_clipboard, parse_html_clipboard, ClipContent, MAX_FORMAT_BYTES,
-        MAX_LOCAL_TOTAL_BYTES,
+        apply_limits, build_html_clipboard, parse_html_clipboard, sanitize_content, ClipContent,
+        MAX_FORMAT_BYTES, MAX_LOCAL_TOTAL_BYTES,
     };
 
     /// `OpenClipboard` 失败后的退避重试次数与间隔。
@@ -1502,10 +1664,13 @@ mod platform {
 
     /// 同时写入所有可用格式；成功返回 true。
     ///
+    /// 写入前统一清洗 HTML/RTF：HTML 走白名单，RTF 含内嵌对象/图片时整段禁用。
     /// 所有权规则：`SetClipboardData` 成功后内存归系统所有，**绝不重复释放**；
     /// 失败时由本函数 `GlobalFree` 回收。
     pub fn set_rich(content: &ClipContent) -> bool {
-        let items = prepare_items(content);
+        let mut sanitized = content.clone();
+        sanitize_content(&mut sanitized);
+        let items = prepare_items(&sanitized);
         if items.is_empty() {
             return false;
         }
@@ -1575,11 +1740,13 @@ mod tests {
             id: "c1".into(),
             text: "hi".into(),
             formats: None,
+            truncated: false,
         })
         .unwrap();
         assert_eq!(v["id"], "c1");
         assert_eq!(v["text"], "hi");
         assert!(v.get("formats").is_none(), "旧被控端不应带 formats");
+        assert!(v.get("truncated").is_none(), "未截断时不带 truncated");
     }
 
     #[test]
@@ -1592,10 +1759,12 @@ mod tests {
                 png: Some("AAAA".into()),
                 ..ClipboardRich::default()
             }),
+            truncated: true,
         })
         .unwrap();
         assert_eq!(v["formats"]["text"], "hi");
         assert_eq!(v["formats"]["png"], "AAAA");
+        assert_eq!(v["truncated"], true);
     }
 
     #[test]
@@ -1642,8 +1811,9 @@ mod tests {
             "text": content.text.clone().unwrap(),
             "formats": Value::Object(map),
         });
-        let parsed = content_from_text_response(&response);
+        let (parsed, truncated) = content_from_text_response(&response);
         assert_eq!(parsed, content);
+        assert!(!truncated);
     }
 
     #[test]
@@ -1745,6 +1915,13 @@ mod tests {
         let text = value["text"].as_str().unwrap_or("");
         assert!(!text.is_empty(), "截断后仍应保留可读前缀");
         assert!(text.chars().count() < 2000);
+        assert_eq!(value["truncated"], true, "截断必须显式标记给查看端");
+    }
+
+    #[test]
+    fn text_response_does_not_mark_short_text_truncated() {
+        let value = text_response(7, &rich_all(), false, MAX_PAYLOAD_LEGACY);
+        assert!(value.get("truncated").is_none());
     }
 
     #[test]
@@ -1915,6 +2092,53 @@ mod tests {
         let raw = build_html_clipboard(&fragment);
         assert_eq!(parse_html_clipboard(&raw), fragment);
         assert_eq!(header_value(&raw, "EndHTML"), raw.len());
+    }
+
+    // ---------- 写入前清洗 ----------
+
+    #[test]
+    fn sanitize_html_keeps_formatting_and_drops_active_content() {
+        let cleaned = sanitize_html(
+            r#"<b onclick="x">粗体</b><script>alert(1)</script><img src="http://e/x.png"><a href="http://e">链接</a><iframe src="x"></iframe>"#,
+        )
+        .expect("清洗后仍有排版内容");
+        assert!(cleaned.contains("<b>粗体</b>"), "排版标签应保留: {cleaned}");
+        assert!(!cleaned.contains("<script"), "脚本必须移除: {cleaned}");
+        assert!(!cleaned.contains("onclick"), "事件属性必须移除: {cleaned}");
+        assert!(!cleaned.contains("<img"), "图片外链必须移除: {cleaned}");
+        assert!(!cleaned.contains("href"), "链接必须移除: {cleaned}");
+        assert!(!cleaned.contains("<iframe"), "iframe 必须移除: {cleaned}");
+    }
+
+    #[test]
+    fn sanitize_html_rejects_oversized_input() {
+        let oversized = format!("<b>{}</b>", "a".repeat(MAX_HTML_BYTES));
+        assert!(sanitize_html(&oversized).is_none());
+    }
+
+    #[test]
+    fn sanitize_rtf_drops_embedded_objects_entirely() {
+        let with_object = r"{\rtf1\ansi 可见 {\*\objdata 0102} 结尾}";
+        assert!(sanitize_rtf(with_object).is_none());
+        let with_picture = r"{\rtf1\ansi 可见 {\pict\pngblip 89504e47} 结尾}";
+        assert!(sanitize_rtf(with_picture).is_none());
+        // 转义的反斜杠不是 destination，应保留原文。
+        let escaped = r"{\rtf1\ansi \\pict 是文本}";
+        assert!(sanitize_rtf(escaped).is_some());
+        let plain = r"{\rtf1\ansi\b 普通粗体}";
+        assert_eq!(sanitize_rtf(plain).as_deref(), Some(plain));
+    }
+
+    #[test]
+    fn sanitize_content_applies_html_and_rtf_rules() {
+        let mut content = ClipContent {
+            html: Some("<script>x</script><i>保留</i>".to_string()),
+            rtf: Some(r"{\rtf1 {\*\objdata 00}}".to_string()),
+            ..ClipContent::default()
+        };
+        sanitize_content(&mut content);
+        assert!(content.html.as_deref().is_some_and(|h| h.contains("<i>保留</i>")));
+        assert!(content.rtf.is_none(), "含内嵌对象的 RTF 应整段丢弃");
     }
 
     /// 只读 smoke：不调用 Empty/Set，绝不覆盖用户剪贴板；打不开（被占用）时跳过。

@@ -814,6 +814,7 @@ const M: Record<string, string> = {
   "rd.clipPushed": "本機のクリップボードを相手に送信しました",
   "rd.clipEnded": "クリップボード同期が終了しました：相手の切断または権限の取り消し",
   "rd.clipEmpty": "相手のクリップボードは空です",
+  "rd.clipTruncated": "相手のテキストが同期上限を超えたため切り詰めました",
   "rd.resync": "再同期",
   "rd.inputRtt": "入力遅延",
   "rd.audio": "音声",

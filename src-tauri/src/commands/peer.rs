@@ -526,12 +526,14 @@ pub async fn peer_clipboard_get_rich(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<peer::clipboard::ClipboardRich> {
-    let content = state
+    let (content, truncated) = state
         .clipboard
         .get_rich(&id)
         .await
         .map_err(AppError::EPeerNotAllowed)?;
-    Ok(peer::clipboard::ClipboardRich::from_content(&content))
+    let mut rich = peer::clipboard::ClipboardRich::from_content(&content);
+    rich.truncated = truncated;
+    Ok(rich)
 }
 
 /// 把富格式写入对端剪贴板；旧被控端只落其中的纯文本。
@@ -556,15 +558,22 @@ pub async fn peer_clipboard_stop(state: State<'_, AppState>, id: String) -> AppR
 }
 
 /// 本机剪贴板文本（查看端按钮用；不经过前端剪贴板权限）。
+///
+/// 放在阻塞线程执行：`OpenClipboard` 失败会退避重试，且文本可能达到数 MiB，
+/// 不能让 Tauri 主线程跟着等。
 #[tauri::command]
-pub fn peer_clipboard_local_get() -> AppResult<String> {
-    Ok(peer::clipboard::local_get())
+pub async fn peer_clipboard_local_get() -> AppResult<String> {
+    tauri::async_runtime::spawn_blocking(peer::clipboard::local_get)
+        .await
+        .map_err(|e| AppError::EInternal(format!("读取本机剪贴板线程失败: {e}")))
 }
 
 /// 本机剪贴板富格式（查看端按钮用；图片为 base64，不渲染 HTML）。
 #[tauri::command]
-pub fn peer_clipboard_local_get_rich() -> AppResult<peer::clipboard::ClipboardRich> {
-    Ok(peer::clipboard::local_get_rich())
+pub async fn peer_clipboard_local_get_rich() -> AppResult<peer::clipboard::ClipboardRich> {
+    tauri::async_runtime::spawn_blocking(peer::clipboard::local_get_rich)
+        .await
+        .map_err(|e| AppError::EInternal(format!("读取本机剪贴板线程失败: {e}")))
 }
 
 /// 本机剪贴板写入的上限（与网络侧同步上限一致）。
@@ -576,19 +585,23 @@ const LOCAL_CLIPBOARD_MAX: usize = 16 * 1024 * 1024;
 /// 无确认的任意剪贴板写入是 WebView 失守后的高危原语（粘贴劫持）——
 /// 至少施加与网络侧同步相同的长度上限，并写入审计日志留痕。
 #[tauri::command]
-pub fn peer_clipboard_local_set(text: String) -> AppResult<bool> {
-    if text.len() > LOCAL_CLIPBOARD_MAX {
-        return Err(AppError::EInvalidInput(format!(
-            "剪贴板内容过大（{} 字节，上限 {} MiB）",
-            text.len(),
-            LOCAL_CLIPBOARD_MAX / (1024 * 1024)
-        )));
-    }
-    applog!(
-        "[peer] 本机剪贴板写入: {} 字节（IPC peer_clipboard_local_set）",
-        text.len()
-    );
-    Ok(peer::clipboard::local_set(&text))
+pub async fn peer_clipboard_local_set(text: String) -> AppResult<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if text.len() > LOCAL_CLIPBOARD_MAX {
+            return Err(AppError::EInvalidInput(format!(
+                "剪贴板内容过大（{} 字节，上限 {} MiB）",
+                text.len(),
+                LOCAL_CLIPBOARD_MAX / (1024 * 1024)
+            )));
+        }
+        applog!(
+            "[peer] 本机剪贴板写入: {} 字节（IPC peer_clipboard_local_set）",
+            text.len()
+        );
+        Ok(peer::clipboard::local_set(&text))
+    })
+    .await
+    .map_err(|e| AppError::EInternal(format!("写入本机剪贴板线程失败: {e}")))?
 }
 
 /// 写入本机剪贴板富格式（查看端按钮用）。
@@ -596,16 +609,22 @@ pub fn peer_clipboard_local_set(text: String) -> AppResult<bool> {
 /// 与旧命令同样是「无确认的任意剪贴板写入」：沿用网络侧的
 /// 单格式 24 MiB / 总量 32 MiB 上限，并记录各格式大小（不记内容）。
 #[tauri::command]
-pub fn peer_clipboard_local_set_rich(content: peer::clipboard::ClipboardRich) -> AppResult<bool> {
-    let content = content.into_content().map_err(AppError::EInvalidInput)?;
-    if content.is_empty() {
-        return Err(AppError::EInvalidInput("剪贴板内容为空".to_string()));
-    }
-    applog!(
-        "[peer] 本机剪贴板写入: {}（IPC peer_clipboard_local_set_rich）",
-        content.summary()
-    );
-    Ok(peer::clipboard::local_set_content(&content))
+pub async fn peer_clipboard_local_set_rich(
+    content: peer::clipboard::ClipboardRich,
+) -> AppResult<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = content.into_content().map_err(AppError::EInvalidInput)?;
+        if content.is_empty() {
+            return Err(AppError::EInvalidInput("剪贴板内容为空".to_string()));
+        }
+        applog!(
+            "[peer] 本机剪贴板写入: {}（IPC peer_clipboard_local_set_rich）",
+            content.summary()
+        );
+        Ok(peer::clipboard::local_set_content(&content))
+    })
+    .await
+    .map_err(|e| AppError::EInternal(format!("写入本机剪贴板线程失败: {e}")))?
 }
 
 /* ---------- 审计 ---------- */

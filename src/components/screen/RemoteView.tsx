@@ -785,6 +785,7 @@ export function RemoteView() {
         if (!ok && r.text) await api.clipboardLocalSet(r.text).catch(() => false);
       }
       showToast(T('rd.clipOn'));
+      if (r.truncated) showToast(T('rd.clipTruncated'));
     } catch (e) {
       showToast(clipError(e));
     } finally {
@@ -811,6 +812,7 @@ export function RemoteView() {
           await api.clipboardLocalSet(rich.text);
         }
         showToast(T('rd.clipPulled'));
+        if (rich.truncated) showToast(T('rd.clipTruncated'));
         return;
       }
       const text = await api.peerClipboardGet(id);

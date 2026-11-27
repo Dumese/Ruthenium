@@ -50,6 +50,7 @@ zeroize = "1.9"
 # 0.10 没有 os_rng 特性，故用 ring 的 SystemRandom 实现 CryptoRng）
 rand_core = "0.10"
 ring = "0.17"
+ammonia = "4.0.3"
 
 # Windows 11 贴靠布局（snap.rs）：原生子窗口 + WM_NCHITTEST。
 # 版本对齐 Cargo.lock 里已有的 windows-sys 0.61.2（tauri/windows 同栈），

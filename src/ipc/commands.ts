@@ -537,13 +537,17 @@ export interface ClipboardFormats {
   rtf?: string;
   png?: string;
   dib?: string;
+  /** 仅读取结果使用：远端文本因协议上限被截断；写入时后端忽略。 */
+  truncated?: boolean;
 }
 
 export interface ClipboardStart {
   id: string;
   text: string;
-  /** 旧被控端 / 空剪贴板时缺省；文本已合并进 `text`。 */
+  /** 旧被控端 / 空剪贴板 / 只有文本时缺省；文本已合并进 `text`。 */
   formats?: ClipboardFormats | null;
+  /** 远端文本是否因协议上限被截断。 */
+  truncated?: boolean;
 }
 export const peerClipboardStart = (screenSessionId: string, token?: string | null) =>
   call<ClipboardStart>('peer_clipboard_start', { screenSessionId, token });

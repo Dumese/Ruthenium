@@ -814,6 +814,7 @@ const M: Record<string, string> = {
   "rd.clipPushed": "Sent this clipboard to the peer",
   "rd.clipEnded": "Clipboard sync ended: the peer disconnected or revoked permission",
   "rd.clipEmpty": "The peer clipboard is empty",
+  "rd.clipTruncated": "Remote text was truncated to the sync limit",
   "rd.resync": "Resync",
   "rd.inputRtt": "input RTT",
   "rd.audio": "Sound",

@@ -814,6 +814,7 @@ const M: Record<string, string> = {
   "rd.clipPushed": "已把本機剪貼簿傳送到對方",
   "rd.clipEnded": "剪貼簿同步已結束：對方斷線或已撤銷授權",
   "rd.clipEmpty": "對方剪貼簿為空",
+  "rd.clipTruncated": "對方文字過長，已依同步上限截斷",
   "rd.resync": "重新同步",
   "rd.inputRtt": "輸入延遲",
   "rd.audio": "聲音",
