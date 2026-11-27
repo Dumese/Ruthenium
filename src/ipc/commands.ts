@@ -505,9 +505,17 @@ export const peerScreenKick = (sessionId: string) => call<boolean>('peer_screen_
 /* ---------- 声音播放 ---------- */
 
 export interface AudioStart { id: string; rate: number; channels: number; frameMs: number }
-/** 音频帧（ipc Channel 推送）：Opus 包 base64。 */
+/** 音频帧（ipc Channel 推送）：Opus 包 base64 或麦克风状态。 */
 export type AudioFrame =
   | { kind: 'data'; sessionId: string; seq: number; data: string }
+  | {
+      kind: 'mic';
+      sessionId: string;
+      on: boolean;
+      /** on / off / denied / unavailable */
+      state: string;
+      detail: string;
+    }
   | { kind: 'error'; sessionId: string; detail: string };
 
 /** 音频帧通道（Tauri ipc Channel；mock 下返回 null）。 */
@@ -524,9 +532,44 @@ export const peerAudioStart = (
 ) => call<AudioStart>('peer_audio_start', { screenSessionId, token, onFrame });
 export const peerAudioStop = (id: string) => call<boolean>('peer_audio_stop', { id });
 
-/** 会话内开关麦克风混音（默认关；被控端懒加载默认录音设备并与系统声混音）。 */
+/** 会话内开关麦克风混音（默认关；被控端先本机确认，再懒加载默认录音设备）。 */
 export const peerAudioSetMic = (id: string, on: boolean) =>
   call<boolean>('peer_audio_set_mic', { id, on });
+
+/* ---------- 被控端麦克风确认 ---------- */
+
+/** 麦克风请求（`peer://mic-request`）：查看端请求采集本机麦克风，需本机确认。 */
+export interface MicRequest {
+  consentId: string;
+  peerName: string;
+  sessionId: string;
+}
+
+/** 麦克风状态（`peer://mic-state`）：被控端横幅据此显示/隐藏。 */
+export interface MicStateEvent {
+  sessionId: string;
+  peerName: string;
+  on: boolean;
+  /** on / off / denied / unavailable */
+  state: string;
+  detail: string;
+}
+
+/** 当前实际在采集麦克风的会话（`peer_mic_sessions`）。 */
+export interface MicSession {
+  sessionId: string;
+  peerName: string;
+  on: boolean;
+}
+
+/** 本机确认麦克风请求；30s 后后端按拒绝处理，命令返回 false 表示已超时。 */
+export const peerMicConsent = (consentId: string, allow: boolean) =>
+  call<boolean>('peer_mic_consent', { consentId, allow });
+/** 本机一键停止某条屏幕会话的麦克风（并阻止本会话再次开启）。 */
+export const peerMicStop = (sessionId: string) =>
+  call<boolean>('peer_mic_stop', { sessionId });
+/** 当前正在采集麦克风的会话（横幅挂载时对账）。 */
+export const peerMicSessions = () => call<MicSession[]>('peer_mic_sessions');
 
 /* ---------- 剪贴板同步 ---------- */
 

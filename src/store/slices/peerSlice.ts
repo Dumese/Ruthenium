@@ -38,6 +38,12 @@ export interface PeerSlice {
   screenBusy: boolean;
   /** 本机正在被查看的屏幕会话（横幅） */
   viewed: api.ViewedSession[];
+  /** 麦克风请求弹窗（null = 无；其余排队） */
+  micReq: api.MicRequest | null;
+  micQueue: api.MicRequest[];
+  micBusy: boolean;
+  /** 本机正在被采集麦克风的会话（横幅） */
+  micActive: api.MicSession[];
   /** 输入通道延迟（sessionId → ms） */
   rtt: Record<string, number>;
   /** 输入通道已断开的屏幕会话（sessionId → 断开的 inputId；前端据此退出操作模式） */
@@ -107,6 +113,16 @@ export interface PeerSlice {
   onClipboardEnded(p: { sessionId: string; id: string }): void;
   /** 重新开启剪贴板前清除“已结束”标记 */
   clearClipboardEnded(sessionId: string): void;
+  /** 受查看端：收到麦克风请求 */
+  onMicRequest(r: api.MicRequest): void;
+  /** 受查看端：允许 / 拒绝麦克风请求 */
+  micConsent(allow: boolean): Promise<void>;
+  /** 刷新「本机正在被采集麦克风」列表 */
+  refreshMicActive(): Promise<void>;
+  /** 本机一键停止某条会话的麦克风 */
+  stopMic(sessionId: string): Promise<void>;
+  /** 麦克风采集状态事件（横幅/一次性清理） */
+  onMicState(ev: api.MicStateEvent): void;
 }
 
 /** 同一次确认的「拒绝」提示只弹一次（本地点击与后端 denied 事件各触发一次）。 */
@@ -156,7 +172,7 @@ export const createPeerSlice: SliceCreator<PeerSlice> = (set, get) => {
   };
 
   return {
-  discovered: [], peers: [], pair: null, pairQueue: [], pairBusy: false, pendingOutgoing: [], pairWaiting: [], inbox: [], controlReq: null, controlQueue: [], controlBusy: false, controlled: [], screenReq: null, screenQueue: [], screenBusy: false, viewed: [], rtt: {}, inputEnded: {}, clipboardEnded: {},
+  discovered: [], peers: [], pair: null, pairQueue: [], pairBusy: false, pendingOutgoing: [], pairWaiting: [], inbox: [], controlReq: null, controlQueue: [], controlBusy: false, controlled: [], screenReq: null, screenQueue: [], screenBusy: false, viewed: [], micReq: null, micQueue: [], micBusy: false, micActive: [], rtt: {}, inputEnded: {}, clipboardEnded: {},
 
   /* ---------- 局域网对等层（发现/配对/设备） ---------- */
   async refreshDiscovered() {
@@ -661,6 +677,61 @@ export const createPeerSlice: SliceCreator<PeerSlice> = (set, get) => {
       set({ viewed: get().viewed.filter((x) => x.sessionId !== ev.sessionId) });
       get().showToast(T('toast.screenEnded', { 0: ev.peerName }));
       void get().refreshViewed();
+    }
+  },
+  onMicRequest(r) {
+    if (!get().micReq) set({ micReq: r });
+    else set({ micQueue: [...get().micQueue, r] });
+  },
+  async micConsent(allow) {
+    const r = get().micReq;
+    if (!r || get().micBusy) return;
+    set({ micBusy: true });
+    try {
+      const hit = await api.peerMicConsent(r.consentId, allow);
+      if (!allow && hit) {
+        get().showToast(T('toast.micDenied', { 0: r.peerName }));
+      }
+      if (get().micReq?.consentId === r.consentId) {
+        const q = get().micQueue;
+        set({ micReq: q[0] ?? null, micQueue: q.slice(1) });
+      }
+    } catch (e) {
+      get().showToast(T('mic.consentFail', {
+        0: terr((e as { code?: string })?.code, (e as { detail?: string })?.detail ?? (e as Error)?.message),
+      }));
+      if (get().micReq?.consentId === r.consentId) {
+        const q = get().micQueue;
+        set({ micReq: q[0] ?? null, micQueue: q.slice(1) });
+      }
+    } finally {
+      set({ micBusy: false });
+    }
+  },
+  async refreshMicActive() {
+    try {
+      set({ micActive: await api.peerMicSessions() });
+    } catch { /* ignore */ }
+  },
+  async stopMic(sessionId) {
+    try {
+      const hit = await api.peerMicStop(sessionId);
+      set({ micActive: get().micActive.filter((x) => x.sessionId !== sessionId) });
+      if (hit) get().showToast(T('mic.stopped'));
+    } catch {
+      get().showToast(T('mic.stopFail'));
+    }
+  },
+  onMicState(ev) {
+    if (ev.on) {
+      const entry: api.MicSession = {
+        sessionId: ev.sessionId,
+        peerName: ev.peerName,
+        on: true,
+      };
+      set({ micActive: [...get().micActive.filter((x) => x.sessionId !== ev.sessionId), entry] });
+    } else {
+      set({ micActive: get().micActive.filter((x) => x.sessionId !== ev.sessionId) });
     }
   },
   };

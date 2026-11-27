@@ -472,7 +472,7 @@ pub async fn peer_audio_stop(state: State<'_, AppState>, id: String) -> AppResul
     Ok(state.audio.close(&id).await)
 }
 
-/// 会话内开关麦克风混音（默认关；被控端懒加载默认录音设备并与系统声混音）。
+/// 会话内开关麦克风混音（默认关；被控端先做本机确认，再懒加载默认录音设备）。
 #[tauri::command]
 pub async fn peer_audio_set_mic(
     state: State<'_, AppState>,
@@ -480,6 +480,32 @@ pub async fn peer_audio_set_mic(
     on: bool,
 ) -> AppResult<bool> {
     Ok(state.audio.set_mic(&id, on).await)
+}
+
+/* ---------- 被控端麦克风确认 ---------- */
+
+/// 本机确认查看端的麦克风请求；超时后返回 `false`（不再命中）。
+#[tauri::command]
+pub async fn peer_mic_consent(
+    state: State<'_, AppState>,
+    consent_id: String,
+    allow: bool,
+) -> AppResult<bool> {
+    Ok(state.peer.mic_consent(&consent_id, allow).await)
+}
+
+/// 本机一键停止某条屏幕会话的麦克风采集，并阻止本会话再次开启。
+#[tauri::command]
+pub async fn peer_mic_stop(state: State<'_, AppState>, session_id: String) -> AppResult<bool> {
+    Ok(state.peer.mic_stop(&session_id).await)
+}
+
+/// 当前实际在采集麦克风的会话（被控端横幅挂载时对账）。
+#[tauri::command]
+pub async fn peer_mic_sessions(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<peer::audio::MicSessionView>> {
+    Ok(state.peer.mic_sessions().await)
 }
 
 /* ---------- 剪贴板同步 ---------- */

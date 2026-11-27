@@ -37,6 +37,8 @@ pub struct SharedPeerState {
     pub control: Arc<ControlHub>,
     /// 屏幕查看（受查看端状态）
     pub screen: Arc<crate::peer::rd::ScreenHub>,
+    /// 被控端麦克风确认与活动采集会话
+    pub mic: Arc<crate::peer::audio::MicHub>,
     /// 本机设备 id（`ruthenium-info` 返回，供控制方展示/审计）
     pub local_id: String,
     /// 本机设备名（与 PeerService 共享，设置页改名后立即生效）
@@ -226,6 +228,9 @@ impl russh::server::Handler for PeerHandler {
             };
             session.channel_success(id)?;
             let hub = self.shared.screen.clone();
+            let mic = self.shared.mic.clone();
+            let app = self.shared.app.clone();
+            let peer_name = peer.name.clone();
             let addr = self.peer_addr;
             // 授权周期复核句柄（peers 实时快照 + 设备 id），撤销即断音频
             let grant_check = GrantCheck {
@@ -233,8 +238,15 @@ impl russh::server::Handler for PeerHandler {
                 peer_id: peer.id.clone(),
             };
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::peer::audio::serve(hub, grant_check, channel.into_stream()).await
+                if let Err(e) = crate::peer::audio::serve(
+                    hub,
+                    grant_check,
+                    mic,
+                    app,
+                    peer_name,
+                    channel.into_stream(),
+                )
+                .await
                 {
                     applog!("[peer] 音频通道结束（{addr:?}）: {e}");
                 }

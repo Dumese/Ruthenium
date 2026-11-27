@@ -34,6 +34,10 @@ pub const PEER_DENIED: &str = "peer://denied";
 pub const PEER_SCREEN_REQUEST: &str = "peer://screen-request";
 /// 受查看会话开始/结束（payload: ScreenSessionEvent），前端横幅据此显示
 pub const PEER_SCREEN_SESSION: &str = "peer://screen-session";
+/// 麦克风请求：查看端请求采集本机麦克风（payload: MicRequest），需本机确认
+pub const PEER_MIC_REQUEST: &str = "peer://mic-request";
+/// 麦克风采集状态变化（payload: MicStateEvent），前端横幅据此显示/隐藏
+pub const PEER_MIC_STATE: &str = "peer://mic-state";
 /// 输入通道延迟（payload: { sessionId, rttMs }）
 pub const PEER_INPUT_STATS: &str = "peer://input-stats";
 /// 查看端的剪贴板通道结束（对端断开 / 授权撤销）：payload: { sessionId, id }

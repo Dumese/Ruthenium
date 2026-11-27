@@ -15,10 +15,11 @@
 //!   48kHz/2ch/f32；驱动拒绝时回退 `GetMixFormat`，按 `dwChannelMask` 做多声道
 //!   下混（L = FL + 0.707·FC + 0.707·SL/BL，R 对称，LFE 丢弃），非 48kHz 时再
 //!   用线性插值重采样。软件处理只在自动转换不可用时启用。
-//! - **麦克风**：默认关闭；查看端发控制帧 `{"type":"mic","on":true}` 后，采集线程
-//!   懒加载默认录音端点（同样事件驱动 + 自动转换），按样本相加混入系统声并软限幅。
-//!   关闭时立即 drop 采集流（释放设备）；打开失败（隐私设置/无设备）只重试并
-//!   继续系统声，不中断通道。
+//! - **麦克风**：默认关闭；查看端发控制帧 `{"type":"mic","on":true}` 后，被控端先
+//!   弹本机确认（30s 超时默认拒绝），允许后才懒加载默认录音端点（同样事件驱动 +
+//!   自动转换），按样本相加混入系统声并软限幅。关闭时立即 drop 采集流（释放设备）；
+//!   打开失败（隐私设置/无设备）只重试并继续系统声，不中断通道。
+//!   确认结果与实际采集状态通过帧类型 4 回传查看端，被控端横幅可一键停止。
 //! - **跟随默认设备**：每 ~1s 比较 `GetDefaultAudioEndpoint(eRender, eConsole)`
 //!   的 `IMMDevice::GetId()`；设备变化或流失效时重建（旧 client Stop/Release →
 //!   新流 Start），重建失败只重试不退出，`seq` 保持连续。
@@ -27,12 +28,13 @@
 //! - **编码**：Opus 48kHz 立体声、20ms 帧、`Application::Audio`、
 //!   `Signal::Auto`、96kbps VBR、complexity 8；不启用 DTX。
 //! - **传输**：`subsystem("ruthenium-audio")`；帧格式 `u32 长度 + [kind][payload]`
-//!   （1=格式 JSON，2=数据 `[u32 seq][opus]`，3=错误文本）。令牌 = 屏幕会话 id。
-//!   查看端 → 服务端只有裸 JSON 控制帧（4 字节长度 + JSON），当前支持 `mic`。
+//!   （1=格式 JSON，2=数据 `[u32 seq][opus]`，3=错误文本，4=麦克风状态 JSON）。
+//!   令牌 = 屏幕会话 id。查看端 → 服务端只有裸 JSON 控制帧（4 字节长度 + JSON），
+//!   当前支持 `mic`。
 //! - **授权**：`grant_audio`；查看端默认关，用户显式开启本次会话；麦克风还要求
-//!   用户单独点按开关（每次会话默认关），不随音频通道自动获得。
-//! - **安全**：只传 Opus 音频帧；麦克风只在显式开启时采集，关闭即释放；会话结束/
-//!   被踢/撤销后通道立即失效。
+//!   被控端每次本机确认（默认拒绝），不随音频授权自动获得。
+//! - **安全**：只传 Opus 音频帧；麦克风只在被控端确认且查看端显式开启时采集，
+//!   关闭即释放；会话结束/被踢/撤销后通道立即失效。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +42,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
@@ -62,12 +65,19 @@ const DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// 单次 `WaitForSingleObject` 的超时（毫秒）。
 ///
 /// 采集本身由事件唤醒，不按固定间隔轮询；这个上限只用于在没有新数据时定期
-/// 检查停止标志和默认设备，保证设备切换/关闭能及时响应。
-#[cfg(windows)]
+/// 检查停止标志和默认设备，保证设备切换/关闭能及时响应。麦克风开启时改用
+/// [`MIC_LOOP_WAIT_MS`]，否则系统声静音时 loopback 不触发事件，麦克风会被
+/// 拖到 200ms 才排空一次。
 const WAIT_SLICE_MS: u32 = 200;
+/// 麦克风开启时系统声采集的等待上限（毫秒）：把麦克风延迟限制在 ~10ms 量级。
+const MIC_LOOP_WAIT_MS: u32 = 10;
 /// 麦克风单次等待上限（毫秒）：只用来排空已到达的包，不能拖慢系统声采集节奏。
 #[cfg(windows)]
 const MIC_WAIT_MS: u32 = 5;
+/// 麦克风本机确认超时：超时按拒绝处理。
+const MIC_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 同一会话两次麦克风确认弹窗的最小间隔，避免被反复刷屏。
+const MIC_PROMPT_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// 打开音频通道的返回（前端据此初始化 WebAudio）。
 #[derive(Debug, Clone, Serialize)]
@@ -93,10 +103,161 @@ pub enum AudioFrame {
         /// Opus 包（base64）
         data: String,
     },
+    /// 被控端确认/采集状态变化：on 为实际采集状态，state 用于区分拒绝/不可用。
+    Mic {
+        session_id: String,
+        on: bool,
+        state: String,
+        detail: String,
+    },
     Error {
         session_id: String,
         detail: String,
     },
+}
+
+/// 麦克风请求弹窗 payload（`peer://mic-request`）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicRequest {
+    pub consent_id: String,
+    pub peer_name: String,
+    pub session_id: String,
+}
+
+/// 麦克风状态事件（`peer://mic-state`）：被控端横幅据此显示/隐藏。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicStateEvent {
+    pub session_id: String,
+    pub peer_name: String,
+    pub on: bool,
+    /// `on` / `off` / `denied` / `unavailable`
+    pub state: String,
+    pub detail: String,
+}
+
+/// 当前正在采集麦克风的会话（横幅挂载时对账用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicSessionView {
+    pub session_id: String,
+    pub peer_name: String,
+    pub on: bool,
+}
+
+struct HostMicSession {
+    peer_name: String,
+    /// 查看端请求的开关状态（采集线程的输入）。
+    requested: Arc<AtomicBool>,
+    /// 麦克风是否真的已打开（采集线程回写，横幅看这个）。
+    active: Arc<AtomicBool>,
+    /// 本机点了「停止」：本会话内不再接受新的开启请求。
+    blocked: Arc<AtomicBool>,
+}
+
+/// 被控端麦克风确认与活动会话表。
+///
+/// 屏幕会话建立音频通道时登记；查看端每次请求开启麦克风都要过一次本机确认
+/// （30s 超时默认拒绝），本机「停止」会置 blocked 并立即释放设备。
+#[derive(Default, Clone)]
+pub struct MicHub {
+    consents: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    sessions: Arc<Mutex<HashMap<String, HostMicSession>>>,
+    /// 同一会话上一次弹窗时间（标准库锁，只在请求线程短暂持有）。
+    prompts: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+}
+
+impl MicHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 是否允许现在弹窗；调用即占用本次配额。
+    fn prompt_allowed(&self, peer_id: &str) -> bool {
+        let now = Instant::now();
+        let mut prompts = self
+            .prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prompts
+            .get(peer_id)
+            .is_some_and(|last| now.duration_since(*last) < MIC_PROMPT_COOLDOWN)
+        {
+            return false;
+        }
+        prompts.insert(peer_id.to_string(), now);
+        true
+    }
+
+    /// 登记一次确认请求，返回 (consent_id, 决策接收端)。
+    async fn request(&self) -> (String, oneshot::Receiver<bool>) {
+        let consent_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.consents.lock().await.insert(consent_id.clone(), tx);
+        (consent_id, rx)
+    }
+
+    /// 前端「允许/拒绝」；超时后返回 false。
+    pub async fn decide(&self, consent_id: &str, allow: bool) -> bool {
+        let Some(tx) = self.consents.lock().await.remove(consent_id) else {
+            return false;
+        };
+        tx.send(allow).is_ok()
+    }
+
+    async fn cancel(&self, consent_id: &str) {
+        self.consents.lock().await.remove(consent_id);
+    }
+
+    async fn register(
+        &self,
+        session_id: &str,
+        peer_name: String,
+        requested: Arc<AtomicBool>,
+        active: Arc<AtomicBool>,
+        blocked: Arc<AtomicBool>,
+    ) {
+        self.sessions.lock().await.insert(
+            session_id.to_string(),
+            HostMicSession {
+                peer_name,
+                requested,
+                active,
+                blocked,
+            },
+        );
+    }
+
+    async fn unregister(&self, session_id: &str) {
+        self.sessions.lock().await.remove(session_id);
+    }
+
+    /// 本机一键停止：立即释放麦克风，并阻止本会话再次开启。
+    pub async fn stop(&self, session_id: &str) -> bool {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(session_id) else {
+            return false;
+        };
+        session.blocked.store(true, Ordering::Relaxed);
+        session.requested.store(false, Ordering::Relaxed);
+        true
+    }
+
+    /// 当前实际在采集麦克风的会话（横幅挂载时对账）。
+    pub async fn active(&self) -> Vec<MicSessionView> {
+        self.sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, session)| session.active.load(Ordering::Relaxed))
+            .map(|(session_id, session)| MicSessionView {
+                session_id: session_id.clone(),
+                peer_name: session.peer_name.clone(),
+                on: true,
+            })
+            .collect()
+    }
 }
 
 struct AudioSession {
@@ -283,6 +444,27 @@ pub async fn open(
                         });
                         break;
                     }
+                    Some(4) => {
+                        let v: serde_json::Value =
+                            serde_json::from_slice(&body[1..]).unwrap_or_default();
+                        let on = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let state = v
+                            .get("state")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("off")
+                            .to_string();
+                        let detail = v
+                            .get("detail")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = on_frame.send(AudioFrame::Mic {
+                            session_id: sid.clone(),
+                            on,
+                            state,
+                            detail,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -312,6 +494,13 @@ pub async fn open(
 enum Out {
     Fmt { rate: u32, channels: u16 },
     Data { seq: u32, data: Vec<u8> },
+    /// 麦克风确认/采集状态；同时回传查看端并驱动被控端横幅。
+    MicState {
+        on: bool,
+        /// `on` / `off` / `denied` / `unavailable`
+        state: String,
+        detail: String,
+    },
     Error(String),
 }
 
@@ -319,9 +508,15 @@ enum Out {
 ///
 /// `grant_check` 每 5s 复核一次授权撤销（只在通道建立时查一次不够，
 /// 撤销后已在传的音频会一直流到屏幕会话结束）。
+///
+/// 麦克风开启前必须经被控端本机确认；确认结果与实际采集状态通过帧类型 4
+/// 回传查看端，同时以 `peer://mic-state` 事件驱动被控端横幅。
 pub async fn serve(
     hub: Arc<ScreenHub>,
     grant_check: crate::peer::server::GrantCheck,
+    mic_hub: Arc<MicHub>,
+    app: tauri::AppHandle,
+    peer_name: String,
     stream: russh::ChannelStream<russh::server::Msg>,
 ) -> AppResult<()> {
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -345,13 +540,35 @@ pub async fn serve(
     let screen_cancel = hub.session_cancel(&token).await.unwrap_or_default();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let mic_on = Arc::new(AtomicBool::new(false));
-    // 控制帧读端：查看端 → 服务端。当前只有麦克风开关；查看端断开时停止采集，
-    // 避免通道结束后还继续占用麦克风/播放设备。
+    // requested：查看端请求的开关（采集线程的输入）；active：麦克风实际已打开
+    // （采集线程回写，横幅看这个）；blocked：本机点了「停止」。
+    let mic_requested = Arc::new(AtomicBool::new(false));
+    let mic_active = Arc::new(AtomicBool::new(false));
+    let mic_blocked = Arc::new(AtomicBool::new(false));
+    let (tx, mut rx) = mpsc::channel::<Out>(32);
+    mic_hub
+        .register(
+            &token,
+            peer_name.clone(),
+            mic_requested.clone(),
+            mic_active.clone(),
+            mic_blocked.clone(),
+        )
+        .await;
+
+    // 控制帧读端：查看端 → 服务端。当前只有麦克风开关；开启必须过本机确认。
+    // 查看端断开时停止采集，避免通道结束后还继续占用麦克风/播放设备。
     {
-        let mic_on = mic_on.clone();
+        let mic_hub = mic_hub.clone();
+        let app = app.clone();
+        let peer_name = peer_name.clone();
+        let session_id = token.clone();
+        let mic_requested = mic_requested.clone();
+        let mic_active = mic_active.clone();
+        let mic_blocked = mic_blocked.clone();
         let stop = stop.clone();
         let cancel = screen_cancel.clone();
+        let tx = tx.clone();
         let mut rd = rd;
         tokio::spawn(async move {
             loop {
@@ -360,21 +577,95 @@ pub async fn serve(
                     frame = read_frame(&mut rd) => frame,
                 };
                 let Some(body) = frame else { break };
-                if let Some(on) = parse_mic_control(&body) {
-                    mic_on.store(on, Ordering::Relaxed);
-                    applog!("[peer] 麦克风混音: {}", if on { "开启" } else { "关闭" });
+                let Some(on) = parse_mic_control(&body) else {
+                    continue;
+                };
+                if !on {
+                    mic_requested.store(false, Ordering::Relaxed);
+                    let _ = tx.try_send(Out::MicState {
+                        on: false,
+                        state: "off".to_string(),
+                        detail: String::new(),
+                    });
+                    applog!("[peer] 麦克风混音: 关闭");
+                    continue;
                 }
+                if mic_requested.load(Ordering::Relaxed) {
+                    // 已在开启/重试中：重复请求只回报当前实际状态。
+                    let active = mic_active.load(Ordering::Relaxed);
+                    let _ = tx.try_send(Out::MicState {
+                        on: active,
+                        state: if active { "on" } else { "off" }.to_string(),
+                        detail: String::new(),
+                    });
+                    continue;
+                }
+                if mic_blocked.load(Ordering::Relaxed) {
+                    let _ = tx.try_send(Out::MicState {
+                        on: false,
+                        state: "denied".to_string(),
+                        detail: "本机已停止麦克风".to_string(),
+                    });
+                    continue;
+                }
+                if !mic_hub.prompt_allowed(&session_id) {
+                    let _ = tx.try_send(Out::MicState {
+                        on: false,
+                        state: "denied".to_string(),
+                        detail: "麦克风请求过于频繁".to_string(),
+                    });
+                    continue;
+                }
+                let (consent_id, consent) = mic_hub.request().await;
+                let _ = app.emit(
+                    crate::events::PEER_MIC_REQUEST,
+                    MicRequest {
+                        consent_id: consent_id.clone(),
+                        peer_name: peer_name.clone(),
+                        session_id: session_id.clone(),
+                    },
+                );
+                applog!("[peer] 麦克风请求: {peer_name}，等待本机确认");
+                let allowed = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        mic_hub.cancel(&consent_id).await;
+                        break;
+                    }
+                    result = tokio::time::timeout(MIC_CONSENT_TIMEOUT, consent) => {
+                        matches!(result, Ok(Ok(true)))
+                    }
+                };
+                if !allowed {
+                    mic_hub.cancel(&consent_id).await;
+                    let _ = tx.try_send(Out::MicState {
+                        on: false,
+                        state: "denied".to_string(),
+                        detail: "本机拒绝麦克风采集".to_string(),
+                    });
+                    applog!("[peer] 麦克风请求被拒绝: {peer_name}");
+                    continue;
+                }
+                if mic_blocked.load(Ordering::Relaxed) {
+                    let _ = tx.try_send(Out::MicState {
+                        on: false,
+                        state: "denied".to_string(),
+                        detail: "本机已停止麦克风".to_string(),
+                    });
+                    continue;
+                }
+                mic_requested.store(true, Ordering::Relaxed);
+                applog!("[peer] 麦克风请求已允许: {peer_name}");
             }
             stop.store(true, Ordering::Relaxed);
         });
     }
-    let (tx, mut rx) = mpsc::channel::<Out>(32);
     {
         let stop = stop.clone();
-        let mic_on = mic_on.clone();
+        let mic_requested = mic_requested.clone();
+        let mic_active = mic_active.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
-            capture_loop(tx, stop, mic_on);
+            capture_loop(tx, stop, mic_requested, mic_active);
         });
     }
     drop(tx);
@@ -421,6 +712,25 @@ pub async fn serve(
                         payload.extend_from_slice(&data);
                         write_frame(&mut wr, 2, &payload).await
                     }
+                    Out::MicState { on, state, detail } => {
+                        let _ = app.emit(
+                            crate::events::PEER_MIC_STATE,
+                            MicStateEvent {
+                                session_id: token.clone(),
+                                peer_name: peer_name.clone(),
+                                on,
+                                state: state.clone(),
+                                detail: detail.clone(),
+                            },
+                        );
+                        let json = serde_json::json!({
+                            "on": on,
+                            "state": state,
+                            "detail": detail,
+                        });
+                        let bytes = serde_json::to_vec(&json).unwrap_or_default();
+                        write_frame(&mut wr, 4, &bytes).await
+                    }
                     Out::Error(detail) => write_frame(&mut wr, 3, detail.as_bytes()).await,
                 }
             } => r,
@@ -431,6 +741,21 @@ pub async fn serve(
     }
     let _ = (&revoked, ()); // revoked 仅作日志语义保留
     stop.store(true, Ordering::Relaxed);
+    mic_requested.store(false, Ordering::Relaxed);
+    // 采集线程退出时不会再发状态帧，这里无条件补一条 off，避免被控端横幅
+    // 在会话消失后残留（前端对不存在的条目会直接忽略）。
+    mic_active.store(false, Ordering::Relaxed);
+    let _ = app.emit(
+        crate::events::PEER_MIC_STATE,
+        MicStateEvent {
+            session_id: token.clone(),
+            peer_name: peer_name.clone(),
+            on: false,
+            state: "off".to_string(),
+            detail: "音频会话已结束".to_string(),
+        },
+    );
+    mic_hub.unregister(&token).await;
     let _ = wr.shutdown().await;
     Ok(())
 }
@@ -440,10 +765,15 @@ pub async fn serve(
 /// 设备切换/失效重建在采集器内部消化，这里只在编码成功时递增 `seq`，
 /// 因此重建期间 seq 保持连续（只是短暂没有新帧，丢帧可接受）。
 ///
-/// 麦克风由 `mic_on` 控制：默认不打开；开启后懒加载并按样本混入系统声，
-/// 关闭/采集失败时立即释放设备。麦克风打开失败只记一次日志并 2s 重试，
-/// 不影响系统声通道。
-fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<AtomicBool>) {
+/// 麦克风由 `mic_requested` 控制：默认不打开；开启后懒加载并按样本混入系统声，
+/// 关闭/采集失败时立即释放设备并回写 `mic_active`。打开失败只记一次日志并
+/// 2s 重试，不影响系统声通道；实际状态经 `Out::MicState` 回传查看端。
+fn capture_loop(
+    tx: mpsc::Sender<Out>,
+    stop: Arc<AtomicBool>,
+    mic_requested: Arc<AtomicBool>,
+    mic_active: Arc<AtomicBool>,
+) {
     let mut cap = match platform::Loopback::new() {
         Ok(c) => c,
         Err(e) => {
@@ -470,12 +800,18 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
     let mut mic_pending: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
     let mut mic_next_try = Instant::now();
     let mut mic_error_logged = false;
+    let mut mic_status: Option<&'static str> = Some("off");
     while !stop.load(Ordering::Relaxed) {
-        let want_mic = mic_on.load(Ordering::Relaxed);
+        let want_mic = mic_requested.load(Ordering::Relaxed);
         if !want_mic {
             if mic.take().is_some() {
                 applog!("[peer] 麦克风混音已关闭，释放麦克风设备");
                 mic_error_logged = false;
+                mic_active.store(false, Ordering::Relaxed);
+                report_mic(&tx, &mut mic_status, false, "off", "");
+            } else {
+                // 下次开启失败时仍要能重新上报 unavailable，不能被旧状态吞掉。
+                mic_status = Some("off");
             }
             mic_pending.clear();
         } else if mic.is_none() && Instant::now() >= mic_next_try {
@@ -484,6 +820,8 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
                     applog!("[peer] 麦克风采集已开启（混入系统声）");
                     mic = Some(capture);
                     mic_error_logged = false;
+                    mic_active.store(true, Ordering::Relaxed);
+                    report_mic(&tx, &mut mic_status, true, "on", "");
                 }
                 Err(e) => {
                     if !mic_error_logged {
@@ -491,13 +829,22 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
                         mic_error_logged = true;
                     }
                     mic_next_try = Instant::now() + Duration::from_secs(2);
+                    mic_active.store(false, Ordering::Relaxed);
+                    report_mic(&tx, &mut mic_status, false, "unavailable", &e);
                 }
             }
         }
-        if let Err(e) = cap.read_into(&mut pending) {
+        // 麦克风开启时缩短等待，避免系统声静音时麦克风被拖到 200ms 才排空。
+        let wait_ms = if mic.is_some() {
+            MIC_LOOP_WAIT_MS
+        } else {
+            WAIT_SLICE_MS
+        };
+        if let Err(e) = cap.read_into(&mut pending, wait_ms) {
             // 只有 Win32 事件等待失败这类不可恢复错误才会到这里；
             // 设备失效/切换都在采集器内部重建。
             applog!("[peer] 音频采集中断: {e}");
+            mic_active.store(false, Ordering::Relaxed);
             let _ = tx.blocking_send(Out::Error(e));
             break;
         }
@@ -515,6 +862,8 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
                     applog!("[peer] 麦克风采集中断，2s 后重试: {e}");
                     mic = None;
                     mic_next_try = Instant::now() + Duration::from_secs(2);
+                    mic_active.store(false, Ordering::Relaxed);
+                    report_mic(&tx, &mut mic_status, false, "unavailable", &e);
                 }
                 None => {}
             }
@@ -530,6 +879,7 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
                         })
                         .is_err()
                     {
+                        mic_active.store(false, Ordering::Relaxed);
                         return;
                     }
                     seq = seq.wrapping_add(1);
@@ -537,11 +887,38 @@ fn capture_loop(tx: mpsc::Sender<Out>, stop: Arc<AtomicBool>, mic_on: Arc<Atomic
                 Ok(_) => {}
                 Err(e) => {
                     applog!("[peer] Opus 编码失败: {e:?}");
+                    mic_active.store(false, Ordering::Relaxed);
                     let _ = tx.blocking_send(Out::Error(format!("Opus 编码失败: {e:?}")));
                     return;
                 }
             }
         }
+    }
+    // 线程退出（停止/会话结束）：`mic` 随作用域释放，这里只回落对外的 active 标记。
+    mic_active.store(false, Ordering::Relaxed);
+}
+
+/// 只在状态变化时发一条麦克风状态，避免每帧刷控制帧。
+fn report_mic(
+    tx: &mpsc::Sender<Out>,
+    last: &mut Option<&'static str>,
+    on: bool,
+    state: &'static str,
+    detail: &str,
+) {
+    if last.as_deref() == Some(state) {
+        return;
+    }
+    *last = Some(state);
+    if tx
+        .try_send(Out::MicState {
+            on,
+            state: state.to_string(),
+            detail: detail.to_string(),
+        })
+        .is_err()
+    {
+        applog!("[peer] 麦克风状态上报失败（通道已关闭）");
     }
 }
 
@@ -957,7 +1334,7 @@ mod platform {
         default_channel_mask, device_id_changed, downmix_frame, downmix_weights, sample_kind,
         soft_limit, CaptureFormat, LinearResampler,
     };
-    use super::{DEVICE_POLL_INTERVAL, MIC_WAIT_MS, RATE, WAIT_SLICE_MS};
+    use super::{DEVICE_POLL_INTERVAL, MIC_WAIT_MS, RATE};
 
     const CLSID_MM_DEVICE_ENUMERATOR: GUID =
         GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
@@ -1116,16 +1493,19 @@ mod platform {
         ///
         /// 设备失效、默认设备切换、驱动重载都在内部重建采集流并继续返回 `Ok`，
         /// 调用方无需感知；只有 Win32 等待失败这类不可恢复错误才返回 `Err`。
-        pub fn read_into(&mut self, out: &mut Vec<f32>) -> Result<(), String> {
+        /// 采集一拍：等事件、排空缓冲，把 48kHz 立体声 f32 追加到 `out`。
+        ///
+        /// `wait_ms` 由调用方决定：麦克风开启时用更短的切片，保证麦克风延迟有界。
+        pub fn read_into(&mut self, out: &mut Vec<f32>, wait_ms: u32) -> Result<(), String> {
             self.maintain();
             let drained = {
                 let Some(stream) = self.stream.as_mut() else {
                     // 当前没有可用设备：按重试节奏等待，避免忙等。
-                    std::thread::sleep(Duration::from_millis(u64::from(WAIT_SLICE_MS)));
+                    std::thread::sleep(Duration::from_millis(u64::from(wait_ms)));
                     return Ok(());
                 };
                 // 事件驱动：有新数据才唤醒；超时只用于响应停止/设备检查。
-                if unsafe { WaitForSingleObject(self.event, WAIT_SLICE_MS) } == WAIT_FAILED {
+                if unsafe { WaitForSingleObject(self.event, wait_ms) } == WAIT_FAILED {
                     return Err("等待音频事件失败".to_string());
                 }
                 stream.drain(out)
@@ -1558,6 +1938,16 @@ mod platform {
         pub fn new() -> Result<Self, String> {
             Err("音频仅支持 Windows".to_string())
         }
+        pub fn read_into(&mut self, _out: &mut Vec<f32>, _wait_ms: u32) -> Result<(), String> {
+            Err("音频仅支持 Windows".to_string())
+        }
+    }
+
+    pub struct MicCapture;
+    impl MicCapture {
+        pub fn new() -> Result<Self, String> {
+            Err("音频仅支持 Windows".to_string())
+        }
         pub fn read_into(&mut self, _out: &mut Vec<f32>) -> Result<(), String> {
             Err("音频仅支持 Windows".to_string())
         }
@@ -1739,7 +2129,7 @@ mod tests {
         let opened = std::thread::spawn(|| match super::platform::Loopback::new() {
             Ok(mut loopback) => {
                 let mut samples = Vec::new();
-                let _ = loopback.read_into(&mut samples);
+                let _ = loopback.read_into(&mut samples, MIC_LOOP_WAIT_MS);
                 true
             }
             Err(_) => false,

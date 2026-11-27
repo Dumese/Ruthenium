@@ -41,6 +41,8 @@ export const EV = {
   peerDenied: 'peer://denied',
   peerScreenRequest: 'peer://screen-request',
   peerScreenSession: 'peer://screen-session',
+  peerMicRequest: 'peer://mic-request',
+  peerMicState: 'peer://mic-state',
   peerInputStats: 'peer://input-stats',
   peerClipboard: 'peer://clipboard',
 } as const;

@@ -25,6 +25,7 @@ import { PeerPairDialog } from './components/peers/PeerPairDialog';
 import { PeerControlDialog } from './components/peers/PeerControlDialog';
 import { PeerControlBanner } from './components/peers/PeerControlBanner';
 import { PeerScreenDialog } from './components/peers/PeerScreenDialog';
+import { PeerMicDialog } from './components/peers/PeerMicDialog';
 import { PeerPanel } from './components/peers/PeerPanel';
 import { RemoteView } from './components/screen/RemoteView';
 import { EncodingPicker } from './components/terminal/EncodingPicker';
@@ -34,7 +35,7 @@ import { Icon } from './components/ui/Icon';
 import { viewState } from './store/selectors';
 import { listen } from './ipc/events';
 import { EV } from './types/events';
-import type { DiscoveredDevice, PairEvent, InboxNotice, ControlRequest, ControlSessionEvent, PeerDeniedEvent, ScreenRequest, ScreenSessionEvent } from './ipc/commands';
+import type { DiscoveredDevice, PairEvent, InboxNotice, ControlRequest, ControlSessionEvent, PeerDeniedEvent, ScreenRequest, ScreenSessionEvent, MicRequest, MicStateEvent } from './ipc/commands';
 import type { InputStatsEvent, ClipboardEndedEvent } from './types/events';
 import { writeTermData } from './components/terminal/useXterm';
 import { T, useLang } from './i18n';
@@ -197,6 +198,13 @@ export default function App() {
         listen<ScreenSessionEvent>(EV.peerScreenSession, (ev) => {
           useAppStore.getState().onScreenSession(ev);
         }),
+        // 被控端麦克风：本机确认 / 采集状态（横幅）
+        listen<MicRequest>(EV.peerMicRequest, (r) => {
+          useAppStore.getState().onMicRequest(r);
+        }),
+        listen<MicStateEvent>(EV.peerMicState, (ev) => {
+          useAppStore.getState().onMicState(ev);
+        }),
         listen<InputStatsEvent>(EV.peerInputStats, (p) => {
           useAppStore.getState().onInputStats(p);
         }),
@@ -238,6 +246,7 @@ export default function App() {
       {booted && <PeerPairDialog />}
       {booted && <PeerControlDialog />}
       {booted && <PeerScreenDialog />}
+      {booted && <PeerMicDialog />}
       <EncodingPicker />
       <ToastHost />
     </div>

@@ -70,6 +70,12 @@ export interface AppStore {
   screenBusy: boolean;
   /** 本机正在被查看的屏幕会话（横幅） */
   viewed: api.ViewedSession[];
+  /** 麦克风请求弹窗（null = 无；其余排队） */
+  micReq: api.MicRequest | null;
+  micQueue: api.MicRequest[];
+  micBusy: boolean;
+  /** 本机正在被采集麦克风的会话（横幅） */
+  micActive: api.MicSession[];
   /** 输入通道延迟（sessionId → ms） */
   rtt: Record<string, number>;
   // 瞬时 UI
@@ -189,6 +195,16 @@ export interface AppStore {
   kickViewed(sessionId: string): Promise<void>;
   /** 受查看会话开始/结束事件 */
   onScreenSession(ev: api.ScreenSessionEvent): void;
+  /** 受查看端：收到麦克风请求 */
+  onMicRequest(r: api.MicRequest): void;
+  /** 受查看端：允许 / 拒绝麦克风请求 */
+  micConsent(allow: boolean): Promise<void>;
+  /** 刷新「本机正在被采集麦克风」列表 */
+  refreshMicActive(): Promise<void>;
+  /** 本机一键停止某条会话的麦克风 */
+  stopMic(sessionId: string): Promise<void>;
+  /** 麦克风采集状态事件 */
+  onMicState(ev: api.MicStateEvent): void;
   /** 输入延迟事件 */
   inputEnded: Record<string, string>;
   onInputStats(p: { sessionId: string; rttMs: number; ended?: boolean; inputId?: string }): void;

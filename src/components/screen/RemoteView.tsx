@@ -93,6 +93,7 @@ export function RemoteView() {
   const [clipBusy, setClipBusy] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
   const [micOn, setMicOn] = useState(false);
+  const [micBusy, setMicBusy] = useState(false);
   const [audioStats, setAudioStats] = useState<AudioStats>({ decoded: 0, peak: 0, rate: 48000, channels: 2 });
   const [volume, setVolume] = useState(0.8);
   const [muted, setMuted] = useState(false);
@@ -113,6 +114,8 @@ export function RemoteView() {
   const audioIdRef = useRef<string | null>(null);
   const audioStopping = useRef(false);
   const startingAudio = useRef(false);
+  /** 麦克风请求等待被控端确认的兜底计时（覆盖后端 30s 确认超时）。 */
+  const micTimer = useRef<number | null>(null);
   const playerRef = useRef<AudioPlayer | null>(null);
   const cursorLayerRef = useRef<HTMLCanvasElement>(null);
   const shapeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -546,11 +549,16 @@ export function RemoteView() {
   const stopAudio = useCallback(() => {    audioStopping.current = true;
     const id = audioIdRef.current;
     audioIdRef.current = null;
+    if (micTimer.current !== null) {
+      window.clearTimeout(micTimer.current);
+      micTimer.current = null;
+    }
     if (id) void api.peerAudioStop(id).catch(() => { /* ignore */ });
     playerRef.current?.stop();
     playerRef.current = null;
     setAudioOn(false);
     setMicOn(false);
+    setMicBusy(false);
     setAudioStats((s) => ({ ...s, decoded: 0, peak: 0 }));
     window.setTimeout(() => { audioStopping.current = false; }, 800);
   }, []);
@@ -592,6 +600,18 @@ export function RemoteView() {
       const ch = api.audioFrameChannel((f) => {
         if (f.kind === 'data') {
           player?.push(f.data, f.seq);
+        } else if (f.kind === 'mic') {
+          // 被控端确认/采集状态：以实际结果为准，不用本地乐观值。
+          if (micTimer.current !== null) {
+            window.clearTimeout(micTimer.current);
+            micTimer.current = null;
+          }
+          setMicBusy(false);
+          setMicOn(f.on);
+          if (f.state === 'on') showToast(T('rd.micOn'));
+          else if (f.state === 'off' && f.detail) showToast(T('rd.micOff'));
+          else if (f.state === 'denied') showToast(T('rd.micDenied', { 0: f.detail }));
+          else if (f.state === 'unavailable') showToast(T('rd.micUnavailable'));
         } else if (!audioStopping.current) {
           showToast(T('err.peerAudioFail', { 0: f.detail }));
           stopAudio();
@@ -613,23 +633,33 @@ export function RemoteView() {
     }
   }, [sessionId, st?.auth?.token, volume, muted, showToast, stopAudio]);
 
-  /** 会话内开关麦克风混音：服务端懒加载默认录音设备，关闭即释放。 */
+  /** 会话内开关麦克风混音：被控端每次开启都要本机确认，状态以回传结果为准。 */
   const toggleMic = useCallback(async () => {
     const id = audioIdRef.current;
-    if (!id) return;
+    if (!id || micBusy) return;
     const next = !micOn;
+    setMicBusy(true);
     try {
       const ok = await api.peerAudioSetMic(id, next);
       if (!ok) {
+        setMicBusy(false);
         showToast(T('rd.micUnavailable'));
         return;
       }
-      setMicOn(next);
-      showToast(next ? T('rd.micOn') : T('rd.micOff'));
+      // 开启要等被控端确认（后端 30s 超时）；关闭通常立即回状态，兜底 3s。
+      // 旧被控端不认控制帧时也能恢复按钮，不会一直卡在 busy。
+      if (micTimer.current !== null) window.clearTimeout(micTimer.current);
+      micTimer.current = window.setTimeout(() => {
+        micTimer.current = null;
+        setMicBusy(false);
+        showToast(T(next ? 'rd.micUnavailable' : 'rd.micOff'));
+      }, next ? 35_000 : 3_000);
+      if (next) showToast(T('rd.micRequesting'));
     } catch {
+      setMicBusy(false);
       showToast(T('rd.micUnavailable'));
     }
-  }, [micOn, showToast]);
+  }, [micBusy, micOn, showToast]);
 
   useEffect(() => {
     // 切换 screen 标签会复用同一个 RemoteView 实例：上一台设备的失败标记、
@@ -1076,9 +1106,11 @@ export function RemoteView() {
             <button
               className={'tbtn' + (micOn ? ' on' : '')}
               data-audio-mic-toggle
+              data-audio-mic-busy={micBusy ? '1' : '0'}
+              disabled={micBusy}
               onClick={() => void toggleMic()}
             >
-              {T('rd.mic')}
+              {micBusy ? T('rd.micRequesting') : T('rd.mic')}
             </button>
           </>
         )}

@@ -117,6 +117,8 @@ struct Inner {
     control: Arc<control::ControlHub>,
     /// 屏幕查看（受查看端状态）
     screen: Arc<rd::ScreenHub>,
+    /// 被控端麦克风确认与活动采集会话
+    mic: Arc<audio::MicHub>,
 }
 
 pub struct PeerService {
@@ -150,6 +152,7 @@ impl PeerService {
                 pair_sessions: Arc::new(pairing::PairSessions::new()),
                 control: Arc::new(control::ControlHub::new()),
                 screen: Arc::new(rd::ScreenHub::new()),
+                mic: Arc::new(audio::MicHub::new()),
             }),
         }
     }
@@ -335,6 +338,7 @@ impl PeerService {
             app: self.inner.app.clone(),
             control: self.inner.control.clone(),
             screen: self.inner.screen.clone(),
+            mic: self.inner.mic.clone(),
             local_id: fp_full.clone(),
             device_name: self.inner.device_name.clone(),
             auth_failures: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -725,6 +729,23 @@ impl PeerService {
 
     pub async fn screen_sessions(&self) -> Vec<rd::ViewSessionView> {
         self.inner.screen.list().await
+    }
+
+    // ---------- 被控端麦克风 ----------
+
+    /// 前端对麦克风请求「允许 / 拒绝」；返回是否命中（超时后不再命中）。
+    pub async fn mic_consent(&self, consent_id: &str, allow: bool) -> bool {
+        self.inner.mic.decide(consent_id, allow).await
+    }
+
+    /// 本机一键停止麦克风：立即释放设备并阻止本会话再次开启。
+    pub async fn mic_stop(&self, session_id: &str) -> bool {
+        self.inner.mic.stop(session_id).await
+    }
+
+    /// 当前实际在采集麦克风的会话（横幅挂载时对账）。
+    pub async fn mic_sessions(&self) -> Vec<audio::MicSessionView> {
+        self.inner.mic.active().await
     }
 
     pub async fn kick_screen(&self, session_id: &str) -> bool {

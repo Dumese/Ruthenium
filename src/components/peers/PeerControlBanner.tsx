@@ -1,5 +1,5 @@
-// 本机被控制 / 被查看的常驻横幅：显示对端设备、来源、尺寸/画质与时长，可一键断开。
-// 数据由 `peer://session` / `peer://screen-session` 事件维护；计时在前端本地每秒刷新。
+// 本机被控制 / 被查看 / 被采集麦克风的常驻横幅：显示对端设备、来源、尺寸/画质与时长，可一键断开。
+// 数据由 `peer://session` / `peer://screen-session` / `peer://mic-state` 事件维护；计时在前端本地每秒刷新。
 import { useEffect, useState } from 'react';
 import { useAppStore } from '../../store/useAppStore';
 import { T, useLang } from '../../i18n';
@@ -9,25 +9,29 @@ export function PeerControlBanner() {
   useLang();
   const controlled = useAppStore((s) => s.controlled);
   const viewed = useAppStore((s) => s.viewed);
+  const micActive = useAppStore((s) => s.micActive);
   const refreshControl = useAppStore((s) => s.refreshControlled);
   const refreshViewed = useAppStore((s) => s.refreshViewed);
+  const refreshMic = useAppStore((s) => s.refreshMicActive);
   const kickControl = useAppStore((s) => s.kickControlled);
   const kickViewed = useAppStore((s) => s.kickViewed);
+  const stopMic = useAppStore((s) => s.stopMic);
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     // 挂载时和后端对账（应用重启时可能已有活动会话），随后靠事件 + 本地计时
     void refreshControl();
     void refreshViewed();
-  }, [refreshControl, refreshViewed]);
+    void refreshMic();
+  }, [refreshControl, refreshViewed, refreshMic]);
 
   useEffect(() => {
-    if (controlled.length === 0 && viewed.length === 0) return;
+    if (controlled.length === 0 && viewed.length === 0 && micActive.length === 0) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [controlled.length, viewed.length]);
+  }, [controlled.length, viewed.length, micActive.length]);
 
-  if (controlled.length === 0 && viewed.length === 0) return null;
+  if (controlled.length === 0 && viewed.length === 0 && micActive.length === 0) return null;
   return (
     <div className="ctrlbanner" data-control-banner>
       <Icon n="shield" s={14} />
@@ -60,6 +64,14 @@ export function PeerControlBanner() {
             </div>
           );
         })}
+        {micActive.map((m) => (
+          <div key={'mic-' + m.sessionId} className="cb-row" data-mic-id={m.sessionId}>
+            <span className="cb-text">{T('mic.banner', { 0: m.peerName })}</span>
+            <button className="tbtn danger" data-mic-stop onClick={() => void stopMic(m.sessionId)}>
+              {T('mic.stop')}
+            </button>
+          </div>
+        ))}
       </div>
     </div>
   );
