@@ -15,8 +15,15 @@ import { isDevOrE2E } from '../../lib/buildMode';
 import { helloRequirement, type HelloAvailability } from '../../ipc/commands';
 import { helloUnavailableText } from '../../lib/helloText';
 import { pickShareFolder } from '../../lib/dialog';
-import { peerCloseWindow, peerOpenWindow, peerSetVisible, peerStatus, type PeerStatus } from '../../ipc/commands';
-import { clipboardLocalSet, peerEncoderDiagnostics } from '../../ipc/commands';
+import {
+  clipboardLocalSet,
+  peerCloseWindow,
+  peerEncoderDiagnostics,
+  peerOpenWindow,
+  peerSetVisible,
+  peerStatus,
+  type PeerStatus,
+} from '../../ipc/commands';
 import type { Lang } from '../../types/models';
 
 /**

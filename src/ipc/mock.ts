@@ -688,17 +688,58 @@ export function mockInvoke<T = void>(cmd: string, args: any = {}): T | Promise<T
       return { id: 'mock-audio-1', rate: 48000, channels: 2, frameMs: 20 } as T;
     case 'peer_audio_stop':
       return true as T;
+    case 'peer_audio_set_mic':
+      return true as T;
+    case 'peer_mic_consent':
+      return true as T;
+    case 'peer_mic_stop':
+      return true as T;
+    case 'peer_mic_sessions':
+      return [] as T;
+    case 'peer_encoder_diagnostics':
+      return {
+        osBuild: 22621,
+        adapters: [{
+          name: 'Mock GPU',
+          vendorId: 0x10de,
+          deviceId: 0x2684,
+          luid: 0,
+          dedicatedVideoMemoryMb: 8192,
+        }],
+        candidates: [{
+          tier: 'hardware',
+          friendlyName: 'Mock H.264 Encoder',
+          hardware: true,
+          hardwareUrl: null,
+          asyncTransform: true,
+          activateOk: true,
+          detail: null,
+        }],
+        preferred: 'Mock H.264 Encoder',
+      } as T;
     case 'peer_clipboard_start':
-      return { id: 'mock-clip-1', text: 'mock clipboard' } as T;
+      return {
+        id: 'mock-clip-1',
+        text: 'mock clipboard',
+        formats: { html: '<b>mock clipboard</b>', png: '' },
+      } as T;
     case 'peer_clipboard_get':
       return 'mock clipboard' as T;
+    case 'peer_clipboard_get_rich':
+      return { text: 'mock clipboard', html: '<b>mock clipboard</b>' } as T;
     case 'peer_clipboard_set':
+      return true as T;
+    case 'peer_clipboard_set_rich':
       return true as T;
     case 'peer_clipboard_stop':
       return true as T;
     case 'peer_clipboard_local_get':
       return 'mock local' as T;
+    case 'peer_clipboard_local_get_rich':
+      return { text: 'mock local', html: '<b>mock local</b>' } as T;
     case 'peer_clipboard_local_set':
+      return true as T;
+    case 'peer_clipboard_local_set_rich':
       return true as T;
     case 'peer_audit_recent':
       return [{ at: '2026-11-17 12:00:00', kind: 'screen', direction: 'incoming', peerName: 'mock-laptop', peerAddr: '192.168.1.50', quality: 65, width: 1920, height: 1080, frames: 120, bytes: 2000000, seconds: 12, reason: 'closed' }] as T;
