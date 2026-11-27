@@ -16,6 +16,7 @@ import { helloRequirement, type HelloAvailability } from '../../ipc/commands';
 import { helloUnavailableText } from '../../lib/helloText';
 import { pickShareFolder } from '../../lib/dialog';
 import { peerCloseWindow, peerOpenWindow, peerSetVisible, peerStatus, type PeerStatus } from '../../ipc/commands';
+import { clipboardLocalSet, peerEncoderDiagnostics } from '../../ipc/commands';
 import type { Lang } from '../../types/models';
 
 /**
@@ -65,8 +66,25 @@ export function SettingsSheet() {
   useLang();
   const s = useSettingsState();
   const dispatch = useAppStore((st) => st.dispatch);
+  const showToast = useAppStore((st) => st.showToast);
+  const [diagBusy, setDiagBusy] = useState(false);
   const overlay = useAppStore((st) => st.overlay);
   const highlightLang = overlay?.kind === 'sheet' && overlay.id === 'settings' && overlay.arg === 'lang';
+  // 编码器诊断：只复制到剪贴板，不落盘、不上报；用户主动点才执行。
+  const copyEncoderDiagnostics = async () => {
+    if (diagBusy) return;
+    setDiagBusy(true);
+    try {
+      const diag = await peerEncoderDiagnostics();
+      await clipboardLocalSet(JSON.stringify(diag, null, 2));
+      showToast(T('set.encoderDiagCopied'));
+    } catch (e) {
+      const detail = (e as { detail?: string })?.detail ?? (e as Error)?.message ?? T('err.unknown');
+      showToast(T('set.encoderDiagFail', { 0: detail }));
+    } finally {
+      setDiagBusy(false);
+    }
+  };
   // 只用一个开关表达 system/off；WebGL 探测不可用时整行禁用并给原因。
   // 低配设备（≤4GB 内存或 ≤2 核）自动走 DOM 渲染器：WebGL 基线 376MB / 每标签 +28MB，
   // DOM 仅 141MB / +2.7MB，且限速下 DOM 的输入延迟更低。
@@ -334,6 +352,9 @@ export function SettingsSheet() {
           <div className="pillrow">
             <Button icon="folder" onClick={() => void s.openLogFolder()}>{T('set.logOpen')}</Button>
             <Button icon="trash" onClick={() => s.requestClearLogs()}>{T('set.logClear')}</Button>
+            <Button icon="copy" disabled={diagBusy} onClick={() => void copyEncoderDiagnostics()}>
+              {T('set.encoderDiag')}
+            </Button>
           </div>
         </div>
       </div>

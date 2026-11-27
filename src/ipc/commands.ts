@@ -346,6 +346,15 @@ export interface MonitorInfo { index: number; width: number; height: number; nam
 export interface WindowInfo { hwnd: number; title: string }
 export interface CursorShapeInfo { width: number; height: number; hotspotX: number; hotspotY: number; rgba: string }
 
+/** 采集健康状态：live 正常；其余为可解释的降级/暂停原因。 */
+export type CaptureStateKind =
+  | 'live'
+  | 'retrying'
+  | 'secureDesktop'
+  | 'protectedWindow'
+  | 'exclusiveFullscreen'
+  | 'suspectedBlackout';
+
 /** 屏幕帧/状态（ipc Channel 推送）。 */
 export type ScreenFrame =
   | {
@@ -407,6 +416,14 @@ export type ScreenFrame =
       width: number;
       height: number;
       reason?: string | null;
+    }
+  | {
+      kind: 'captureState';
+      sessionId: string;
+      /** 采集健康状态：live 正常；其余为可解释的降级/暂停原因 */
+      state: CaptureStateKind;
+      /** 诊断详情（只用于日志/排障，界面按 state 走词条） */
+      detail: string;
     };
 
 /** 屏幕帧通道（Tauri ipc Channel；mock 下返回 null，不构造 Channel）。 */
@@ -425,6 +442,31 @@ export const peerOpenScreen = (
 export const peerScreenCommand = (sessionId: string, cmd: Record<string, unknown>) =>
   call<boolean>('peer_screen_command', { sessionId, cmd });
 export const peerCloseScreen = (sessionId: string) => call<boolean>('peer_close_screen', { sessionId });
+
+/** 一个编码器候选（`peer_encoder_diagnostics`）。 */
+export interface EncoderCandidate {
+  /** `hardware` / `software` */
+  tier: string;
+  friendlyName?: string | null;
+  hardware: boolean;
+  /** MFT_ENUM_HARDWARE_URL_Attribute；软件 MFT 通常为空 */
+  hardwareUrl?: string | null;
+  /** 硬件 MFT 按规范必须是异步的；为 true 时当前同步编码路径无法直接驱动 */
+  asyncTransform: boolean;
+  activateOk: boolean;
+  detail?: string | null;
+}
+
+/** 编码器能力诊断：回答「这台机器为什么没有硬编」。 */
+export interface EncoderDiagnostics {
+  osBuild?: number | null;
+  adapters: { name: string; vendorId: number; deviceId: number; luid: number; dedicatedVideoMemoryMb: number }[];
+  candidates: EncoderCandidate[];
+  preferred?: string | null;
+}
+
+/** 编码器能力诊断（设置页「复制编码诊断」用；耗时操作由后端放后台线程）。 */
+export const peerEncoderDiagnostics = () => call<EncoderDiagnostics>('peer_encoder_diagnostics');
 
 /** 屏幕查看请求（`peer://screen-request`）。 */
 export interface ScreenRequest {
@@ -482,19 +524,48 @@ export const peerAudioStart = (
 ) => call<AudioStart>('peer_audio_start', { screenSessionId, token, onFrame });
 export const peerAudioStop = (id: string) => call<boolean>('peer_audio_stop', { id });
 
+/** 会话内开关麦克风混音（默认关；被控端懒加载默认录音设备并与系统声混音）。 */
+export const peerAudioSetMic = (id: string, on: boolean) =>
+  call<boolean>('peer_audio_set_mic', { id, on });
+
 /* ---------- 剪贴板同步 ---------- */
 
-export interface ClipboardStart { id: string; text: string }
+/** 剪贴板富格式载荷：文本类为 UTF-8 字符串，png/dib 为原始字节的 base64（不渲染/不转码）。 */
+export interface ClipboardFormats {
+  text?: string;
+  html?: string;
+  rtf?: string;
+  png?: string;
+  dib?: string;
+}
+
+export interface ClipboardStart {
+  id: string;
+  text: string;
+  /** 旧被控端 / 空剪贴板时缺省；文本已合并进 `text`。 */
+  formats?: ClipboardFormats | null;
+}
 export const peerClipboardStart = (screenSessionId: string, token?: string | null) =>
   call<ClipboardStart>('peer_clipboard_start', { screenSessionId, token });
 export const peerClipboardGet = (id: string) => call<string>('peer_clipboard_get', { id });
 export const peerClipboardSet = (id: string, text: string) =>
   call<boolean>('peer_clipboard_set', { id, text });
+/** 拉取对端剪贴板全部富格式（旧被控端只回文本；命令不可用时调用方回退 `peerClipboardGet`）。 */
+export const peerClipboardGetRich = (id: string) =>
+  call<ClipboardFormats>('peer_clipboard_get_rich', { id });
+/** 把富格式写入对端剪贴板（旧被控端只落其中的纯文本）。 */
+export const peerClipboardSetRich = (id: string, content: ClipboardFormats) =>
+  call<boolean>('peer_clipboard_set_rich', { id, content });
 export const peerClipboardStop = (id: string) => call<boolean>('peer_clipboard_stop', { id });
 /** 本机剪贴板（查看端按钮用，后端直接读写，避免 WebView 权限差异）。 */
 export const clipboardLocalGet = () => call<string>('peer_clipboard_local_get');
 export const clipboardLocalSet = (text: string) =>
   call<boolean>('peer_clipboard_local_set', { text });
+/** 本机剪贴板全部格式（图片 base64；命令不可用时调用方回退 `clipboardLocalGet`）。 */
+export const clipboardLocalGetRich = () => call<ClipboardFormats>('peer_clipboard_local_get_rich');
+/** 写入本机剪贴板全部格式；无确认的高危原语，后端已限大小并记审计日志。 */
+export const clipboardLocalSetRich = (content: ClipboardFormats) =>
+  call<boolean>('peer_clipboard_local_set_rich', { content });
 
 /* ---------- 审计 ---------- */
 

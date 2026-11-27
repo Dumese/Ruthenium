@@ -413,6 +413,14 @@ pub async fn peer_screen_kick(state: State<'_, AppState>, session_id: String) ->
     Ok(state.peer.kick_screen(&session_id).await)
 }
 
+/// 编码器能力诊断（设置页「复制编码诊断」用）：枚举 + 激活检查会阻塞，放后台线程。
+#[tauri::command]
+pub async fn peer_encoder_diagnostics() -> AppResult<peer::h264::EncoderDiagnostics> {
+    tauri::async_runtime::spawn_blocking(peer::h264::diagnostics)
+        .await
+        .map_err(|e| AppError::EInternal(format!("编码器诊断线程失败: {e}")))
+}
+
 /* ---------- 远程桌面（操作） ---------- */
 
 /// 为某条屏幕会话打开输入通道（令牌 = 屏幕会话 id）。
@@ -464,9 +472,21 @@ pub async fn peer_audio_stop(state: State<'_, AppState>, id: String) -> AppResul
     Ok(state.audio.close(&id).await)
 }
 
+/// 会话内开关麦克风混音（默认关；被控端懒加载默认录音设备并与系统声混音）。
+#[tauri::command]
+pub async fn peer_audio_set_mic(
+    state: State<'_, AppState>,
+    id: String,
+    on: bool,
+) -> AppResult<bool> {
+    Ok(state.audio.set_mic(&id, on).await)
+}
+
 /* ---------- 剪贴板同步 ---------- */
 
 /// 为某条屏幕会话打开剪贴板通道（默认关，用户显式开启）。
+///
+/// 返回体在 `id`/`text` 之外可带富格式 `formats`（旧被控端没有该字段）。
 #[tauri::command]
 pub async fn peer_clipboard_start(
     state: State<'_, AppState>,
@@ -500,6 +520,35 @@ pub async fn peer_clipboard_set(
         .map_err(AppError::EPeerNotAllowed)
 }
 
+/// 拉取对端剪贴板富格式（文本 + HTML/RTF/PNG/DIB；图片为 base64）。
+#[tauri::command]
+pub async fn peer_clipboard_get_rich(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<peer::clipboard::ClipboardRich> {
+    let content = state
+        .clipboard
+        .get_rich(&id)
+        .await
+        .map_err(AppError::EPeerNotAllowed)?;
+    Ok(peer::clipboard::ClipboardRich::from_content(&content))
+}
+
+/// 把富格式写入对端剪贴板；旧被控端只落其中的纯文本。
+#[tauri::command]
+pub async fn peer_clipboard_set_rich(
+    state: State<'_, AppState>,
+    id: String,
+    content: peer::clipboard::ClipboardRich,
+) -> AppResult<bool> {
+    let content = content.into_content().map_err(AppError::EInvalidInput)?;
+    state
+        .clipboard
+        .set_rich(&id, &content)
+        .await
+        .map_err(AppError::EPeerNotAllowed)
+}
+
 /// 关闭剪贴板通道。
 #[tauri::command]
 pub async fn peer_clipboard_stop(state: State<'_, AppState>, id: String) -> AppResult<bool> {
@@ -510,6 +559,12 @@ pub async fn peer_clipboard_stop(state: State<'_, AppState>, id: String) -> AppR
 #[tauri::command]
 pub fn peer_clipboard_local_get() -> AppResult<String> {
     Ok(peer::clipboard::local_get())
+}
+
+/// 本机剪贴板富格式（查看端按钮用；图片为 base64，不渲染 HTML）。
+#[tauri::command]
+pub fn peer_clipboard_local_get_rich() -> AppResult<peer::clipboard::ClipboardRich> {
+    Ok(peer::clipboard::local_get_rich())
 }
 
 /// 本机剪贴板写入的上限（与网络侧同步上限一致）。
@@ -534,6 +589,23 @@ pub fn peer_clipboard_local_set(text: String) -> AppResult<bool> {
         text.len()
     );
     Ok(peer::clipboard::local_set(&text))
+}
+
+/// 写入本机剪贴板富格式（查看端按钮用）。
+///
+/// 与旧命令同样是「无确认的任意剪贴板写入」：沿用网络侧的
+/// 单格式 24 MiB / 总量 32 MiB 上限，并记录各格式大小（不记内容）。
+#[tauri::command]
+pub fn peer_clipboard_local_set_rich(content: peer::clipboard::ClipboardRich) -> AppResult<bool> {
+    let content = content.into_content().map_err(AppError::EInvalidInput)?;
+    if content.is_empty() {
+        return Err(AppError::EInvalidInput("剪贴板内容为空".to_string()));
+    }
+    applog!(
+        "[peer] 本机剪贴板写入: {}（IPC peer_clipboard_local_set_rich）",
+        content.summary()
+    );
+    Ok(peer::clipboard::local_set_content(&content))
 }
 
 /* ---------- 审计 ---------- */

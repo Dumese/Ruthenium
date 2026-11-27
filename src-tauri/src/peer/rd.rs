@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::peer::capture_state;
 use crate::peer::client;
 use crate::peer::peers::PeerRecord;
 use crate::state::AppState;
@@ -403,8 +404,8 @@ mod platform {
     };
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, IsWindow, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+        EnumWindows, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsWindow,
+        IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
     };
 
     fn status_ok(s: Status, what: &str) -> anyhow::Result<()> {
@@ -569,10 +570,13 @@ mod platform {
         }
     }
 
-    /// 锁屏 / UAC 安全桌面：本进程看不到前台窗口。此时 WGC 也只能拿到静止画面，
+    /// 锁屏 / UAC 安全桌面：本进程看不到输入桌面。此时 WGC 也只能拿到静止画面，
     /// 保持“暂不可用”的提示并按 2s 重试更合适，解锁后会自动恢复。
     fn secure_desktop() -> bool {
-        unsafe { GetForegroundWindow().is_invalid() }
+        matches!(
+            capture_state::probe_desktop().kind,
+            capture_state::DesktopKind::Secure | capture_state::DesktopKind::Unknown
+        )
     }
 
     /// 输出是否真的在桌面上：休眠/断开的 DisplayPort、虚拟显示驱动的影子输出
@@ -1937,6 +1941,36 @@ fn emit_cursor(
     let _ = tx.try_send(msg);
 }
 
+/// 上报采集状态变化：只在变化时发一条控制消息，避免静止画面也刷屏。
+fn report_capture_state(tx: &mpsc::Sender<serde_json::Value>, change: &capture_state::StateChange) {
+    applog!(
+        "[peer-screen] 采集状态: {} -> {}（{}）",
+        change.from.as_str(),
+        change.to.as_str(),
+        change.detail
+    );
+    let _ = tx.try_send(serde_json::json!({
+        "type": "captureState",
+        "state": change.to.as_str(),
+        "detail": change.detail,
+    }));
+}
+
+/// 喂一次健康观测并上报变化，返回状态机当前状态。
+///
+/// 状态机只做判定；采集源重建由调用方按状态决定（安全桌面恢复后 duplication
+/// 已经失效，必须重建）。
+fn drive_capture_health(
+    tracker: &mut capture_state::HealthTracker,
+    tx: &mpsc::Sender<serde_json::Value>,
+    obs: capture_state::Observation,
+) -> capture_state::CaptureState {
+    if let Some(change) = tracker.observe(&obs) {
+        report_capture_state(tx, &change);
+    }
+    tracker.state()
+}
+
 /// 无论正常结束还是提前 return，都取消采集线程的令牌。
 struct CancelOnDrop(CancellationToken);
 
@@ -2177,8 +2211,20 @@ async fn run_stream(
             let mut cursor_visible = false;
             let mut cursor_pos = (i32::MIN, i32::MIN);
 
+            // 采集健康探测：桌面 / 受保护窗口 / 全屏 D3D 每 200ms 刷新一次，
+            // 避免每个采集循环都调系统 API。
+            let mut desktop_probe = capture_state::probe_desktop();
+            let mut protected = capture_state::probe_foreground_protected();
+            let mut d3d_fullscreen = capture_state::probe_d3d_fullscreen();
+            let mut probe_at = Instant::now();
+            let mut health = capture_state::HealthTracker::new();
+            // 窗口共享的目标句柄；桌面共享时为 None。
+            let mut window_hwnd: Option<u64> = None;
+
             let (w0, h0) = source.size();
             let _ = ctrl_tx.try_send(stream_msg_json("jpeg", fps, 0, w0, h0, None));
+            // 后台记录一次编码器能力表：不阻塞首帧，用户报障时日志里直接有答案。
+            crate::peer::h264::log_diagnostics_async();
 
             loop {
                 if cancel.is_cancelled() || revoked.is_cancelled() {
@@ -2207,6 +2253,8 @@ async fn run_stream(
                         }
                         Ok(ClientCmd::Monitor { index }) => {
                             monitor = index;
+                            window_hwnd = None;
+                            probe_at = Instant::now() - Duration::from_millis(200);
                             // 同一进程对同一显示器只允许一份桌面复制：
                             // 必须先释放旧采集，否则重建会拿到 E_INVALIDARG。
                             source.release();
@@ -2301,6 +2349,8 @@ async fn run_stream(
                         Ok(ClientCmd::Window { hwnd, title }) => match Source::window(hwnd) {
                             Ok(s) => {
                                 source = s;
+                                window_hwnd = Some(hwnd);
+                                probe_at = Instant::now() - Duration::from_millis(200);
                                 last_hash = 0;
                                 force_key = true;
                                 cursor_hash = 0;
@@ -2342,6 +2392,8 @@ async fn run_stream(
                             match Source::desktop(monitor) {
                                 Ok(s) => {
                                     source = s;
+                                    window_hwnd = None;
+                                    probe_at = Instant::now() - Duration::from_millis(200);
                                     last_hash = 0;
                                     force_key = true;
                                     cursor_hash = 0;
@@ -2436,9 +2488,94 @@ async fn run_stream(
                     std::thread::sleep(rem.min(Duration::from_millis(40)));
                 }
 
+                // 采集健康：每 200ms 刷新一次桌面 / 受保护窗口 / 全屏 D3D 探测。
+                if probe_at.elapsed() >= Duration::from_millis(200) {
+                    desktop_probe = capture_state::probe_desktop();
+                    protected = match window_hwnd {
+                        Some(hwnd) => capture_state::probe_window_protected(hwnd),
+                        None => capture_state::probe_foreground_protected(),
+                    };
+                    d3d_fullscreen = capture_state::probe_d3d_fullscreen();
+                    probe_at = Instant::now();
+                }
+
+                // 已确认的安全桌面 / 受保护窗口：不再抓屏，等状态恢复后再继续。
+                if matches!(
+                    health.state(),
+                    capture_state::CaptureState::SecureDesktop
+                        | capture_state::CaptureState::ProtectedWindow
+                ) {
+                    let before = health.state();
+                    let state = drive_capture_health(
+                        &mut health,
+                        &ctrl_tx,
+                        capture_state::Observation {
+                            desktop: desktop_probe.clone(),
+                            protected,
+                            d3d_fullscreen,
+                            grab: capture_state::GrabOutcome::NoChange,
+                            frame_dark: false,
+                        },
+                    );
+                    if state != before {
+                        if before == capture_state::CaptureState::SecureDesktop {
+                            // 安全桌面恢复后 duplication 已失效：先释放再重建。
+                            source.release();
+                            match Source::desktop(monitor) {
+                                Ok(c) => {
+                                    source = c;
+                                    window_hwnd = None;
+                                    last_hash = 0;
+                                    force_key = true;
+                                    let _ = ctrl_tx.try_send(serde_json::json!({
+                                        "type": "source",
+                                        "source": "desktop",
+                                        "reason": "安全桌面恢复后重建采集",
+                                    }));
+                                }
+                                Err(e) => {
+                                    applog!("[peer-screen] 安全桌面恢复后重建采集失败: {e}");
+                                }
+                            }
+                        } else {
+                            last_hash = 0;
+                            force_key = true;
+                        }
+                    }
+                    if matches!(
+                        state,
+                        capture_state::CaptureState::SecureDesktop
+                            | capture_state::CaptureState::ProtectedWindow
+                    ) {
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                }
+
                 match source.grab(20) {
                     Ok(g) => {
                         let (w, h) = source.size();
+                        let frame_dark =
+                            capture_state::frame_is_dark(&g.bgra, g.stride as usize, w, h);
+                        let state = drive_capture_health(
+                            &mut health,
+                            &ctrl_tx,
+                            capture_state::Observation {
+                                desktop: desktop_probe.clone(),
+                                protected,
+                                d3d_fullscreen,
+                                grab: capture_state::GrabOutcome::Frame,
+                                frame_dark,
+                            },
+                        );
+                        if matches!(
+                            state,
+                            capture_state::CaptureState::SecureDesktop
+                                | capture_state::CaptureState::ProtectedWindow
+                        ) {
+                            std::thread::sleep(Duration::from_millis(150));
+                            continue;
+                        }
                         if codec_is_h264 {
                             let want = (scaled_dim(w, scale), scaled_dim(h, scale));
                             let mismatch = encoder
@@ -2548,19 +2685,52 @@ async fn run_stream(
                         force_key = false;
                     }
                     Err(GrabError::NoChange) => {
+                        drive_capture_health(
+                            &mut health,
+                            &ctrl_tx,
+                            capture_state::Observation {
+                                desktop: desktop_probe.clone(),
+                                protected,
+                                d3d_fullscreen,
+                                grab: capture_state::GrabOutcome::NoChange,
+                                frame_dark: false,
+                            },
+                        );
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(GrabError::Lost(why)) | Err(GrabError::Failed(why)) => {
+                        let state = drive_capture_health(
+                            &mut health,
+                            &ctrl_tx,
+                            capture_state::Observation {
+                                desktop: desktop_probe.clone(),
+                                protected,
+                                d3d_fullscreen,
+                                grab: capture_state::GrabOutcome::Lost,
+                                frame_dark: false,
+                            },
+                        );
+                        if state == capture_state::CaptureState::SecureDesktop {
+                            std::thread::sleep(Duration::from_millis(250));
+                            continue;
+                        }
                         if why != "采集已释放" {
                             applog!("[peer] 屏幕采集重建（{why}）");
                         }
-                        std::thread::sleep(Duration::from_millis(300));
+                        // 独占全屏下复制会反复丢失：放慢重建，避免每秒空转十几次。
+                        let backoff = if state == capture_state::CaptureState::ExclusiveFullscreen {
+                            Duration::from_millis(800)
+                        } else {
+                            Duration::from_millis(300)
+                        };
+                        std::thread::sleep(backoff);
                         if source.is_window() {
                             // 窗口关闭/捕获结束：回退整个桌面，避免整条会话中断
                             source.release();
                             match Source::desktop(monitor) {
                                 Ok(c) => {
                                     source = c;
+                                    window_hwnd = None;
                                     last_hash = 0;
                                     force_key = true;
                                     let _ = ctrl_tx.try_send(serde_json::json!({
@@ -2863,6 +3033,12 @@ pub enum ScreenFrame {
         width: u32,
         height: u32,
         reason: Option<String>,
+    },
+    /// 采集健康状态（安全桌面/受保护窗口/独占全屏/重建/疑似黑屏；只在变化时下发）
+    CaptureState {
+        session_id: String,
+        state: String,
+        detail: String,
     },
 }
 
@@ -3227,6 +3403,21 @@ pub async fn open_viewer(
                                                 .map(|s| s.to_string()),
                                         });
                                     }
+                                    Some("captureState") => {
+                                        let _ = on_frame.send(ScreenFrame::CaptureState {
+                                            session_id: sid.clone(),
+                                            state: obj
+                                                .get("state")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("live")
+                                                .to_string(),
+                                            detail: obj
+                                                .get("detail")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        });
+                                    }
                                     _ => {}
                                 }
                             }
@@ -3377,6 +3568,16 @@ mod tests {
         .expect("serialize monitors");
         assert_eq!(m["kind"], "monitors");
         assert_eq!(m["items"][0]["width"], 10);
+
+        let cs = serde_json::to_value(ScreenFrame::CaptureState {
+            session_id: "s1".into(),
+            state: "secureDesktop".into(),
+            detail: "输入桌面不是 Default".into(),
+        })
+        .expect("serialize capture state");
+        assert_eq!(cs["kind"], "captureState");
+        assert_eq!(cs["state"], "secureDesktop");
+        assert_eq!(cs["detail"], "输入桌面不是 Default");
     }
 
     /// 静止画面判定用的采样哈希：同一内容稳定，关键采样点变化必须变。

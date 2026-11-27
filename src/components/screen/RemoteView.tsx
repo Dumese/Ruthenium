@@ -11,6 +11,24 @@ import { Icon } from '../ui/Icon';
 
 const QUALITIES = [45, 65, 80] as const;
 
+/** 采集健康状态 → 提示文案；`live` 与未知状态不提示。 */
+function captureWarnText(state: string): string | null {
+  switch (state) {
+    case 'secureDesktop':
+      return T('rd.captureState.secureDesktop');
+    case 'protectedWindow':
+      return T('rd.captureState.protectedWindow');
+    case 'exclusiveFullscreen':
+      return T('rd.captureState.exclusiveFullscreen');
+    case 'suspectedBlackout':
+      return T('rd.captureState.suspectedBlackout');
+    case 'retrying':
+      return T('rd.captureState.retrying');
+    default:
+      return null;
+  }
+}
+
 function qualityKey(q: number): string {
   return q <= 45 ? 'rd.quality.flow' : q >= 80 ? 'rd.quality.hd' : 'rd.quality.balanced';
 }
@@ -74,6 +92,7 @@ export function RemoteView() {
   const [clipId, setClipId] = useState<string | null>(null);
   const [clipBusy, setClipBusy] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
+  const [micOn, setMicOn] = useState(false);
   const [audioStats, setAudioStats] = useState<AudioStats>({ decoded: 0, peak: 0, rate: 48000, channels: 2 });
   const [volume, setVolume] = useState(0.8);
   const [muted, setMuted] = useState(false);
@@ -531,6 +550,7 @@ export function RemoteView() {
     playerRef.current?.stop();
     playerRef.current = null;
     setAudioOn(false);
+    setMicOn(false);
     setAudioStats((s) => ({ ...s, decoded: 0, peak: 0 }));
     window.setTimeout(() => { audioStopping.current = false; }, 800);
   }, []);
@@ -592,6 +612,24 @@ export function RemoteView() {
       startingAudio.current = false;
     }
   }, [sessionId, st?.auth?.token, volume, muted, showToast, stopAudio]);
+
+  /** 会话内开关麦克风混音：服务端懒加载默认录音设备，关闭即释放。 */
+  const toggleMic = useCallback(async () => {
+    const id = audioIdRef.current;
+    if (!id) return;
+    const next = !micOn;
+    try {
+      const ok = await api.peerAudioSetMic(id, next);
+      if (!ok) {
+        showToast(T('rd.micUnavailable'));
+        return;
+      }
+      setMicOn(next);
+      showToast(next ? T('rd.micOn') : T('rd.micOff'));
+    } catch {
+      showToast(T('rd.micUnavailable'));
+    }
+  }, [micOn, showToast]);
 
   useEffect(() => {
     // 切换 screen 标签会复用同一个 RemoteView 实例：上一台设备的失败标记、
@@ -673,6 +711,8 @@ export function RemoteView() {
   const allowInput = st?.auth?.allowInput ?? false;
   const allowClipboard = st?.auth?.clipboard ?? false;
   const codecNow = st?.stream?.codec ?? st?.frame?.codec ?? 'jpeg';
+  const captureStateNow = st?.captureState?.state ?? 'live';
+  const captureWarn = captureWarnText(captureStateNow);
 
   const send = (cmd: Record<string, unknown>) => {
     void api.peerScreenCommand(sessionId, cmd).catch(() => {
@@ -726,14 +766,24 @@ export function RemoteView() {
       0: String((e as { detail?: string })?.detail ?? (e as Error)?.message ?? T('err.unknown')),
     });
 
+  /** 剪贴板负载是否有可写内容（空字符串按空处理，避免用空文本覆盖本机剪贴板）。 */
+  const hasClipPayload = (c: api.ClipboardFormats | null | undefined): boolean =>
+    !!(c && (c.text || c.html || c.rtf || c.png || c.dib));
+
   const startClipboard = async () => {
     setClipBusy(true);
     try {
       const r = await api.peerClipboardStart(sessionId, st?.auth?.token ?? null);
       clipRef.current = r.id;
       setClipId(r.id);
-      // 开启即同步一次远端 → 本机（用户显式点击，语义明确）
-      if (r.text) await api.clipboardLocalSet(r.text).catch(() => false);
+      // 开启即同步一次远端 → 本机（用户显式点击，语义明确）。
+      // 富格式优先；旧后端没有 local_set_rich 时回退旧命令写文本。
+      const content: api.ClipboardFormats = { ...(r.formats ?? {}) };
+      if (r.text && !content.text) content.text = r.text;
+      if (hasClipPayload(content)) {
+        const ok = await api.clipboardLocalSetRich(content).catch(() => false);
+        if (!ok && r.text) await api.clipboardLocalSet(r.text).catch(() => false);
+      }
       showToast(T('rd.clipOn'));
     } catch (e) {
       showToast(clipError(e));
@@ -743,10 +793,27 @@ export function RemoteView() {
   };
 
   const pullClipboard = async () => {
-    if (!clipRef.current) return;
+    const id = clipRef.current;
+    if (!id) return;
     setClipBusy(true);
     try {
-      const text = await api.peerClipboardGet(clipRef.current);
+      // 富格式优先；命令不可用（旧后端）时回退纯文本 + 旧命令。
+      const rich = await api.peerClipboardGetRich(id).catch(() => null);
+      if (rich) {
+        if (!hasClipPayload(rich)) {
+          showToast(T('rd.clipEmpty'));
+          return;
+        }
+        const ok = await api.clipboardLocalSetRich(rich).catch(() => false);
+        if (!ok) {
+          // 富格式整体写入失败时，至少把文本写进去（与旧行为一致）。
+          if (!rich.text) throw new Error(T('err.peerClipboardWrite'));
+          await api.clipboardLocalSet(rich.text);
+        }
+        showToast(T('rd.clipPulled'));
+        return;
+      }
+      const text = await api.peerClipboardGet(id);
       await api.clipboardLocalSet(text);
       showToast(T('rd.clipPulled'));
     } catch (e) {
@@ -757,11 +824,24 @@ export function RemoteView() {
   };
 
   const pushClipboard = async () => {
-    if (!clipRef.current) return;
+    const id = clipRef.current;
+    if (!id) return;
     setClipBusy(true);
     try {
-      const text = await api.clipboardLocalGet();
-      await api.peerClipboardSet(clipRef.current, text);
+      // 读本机富格式发送；旧后端没有 local_get_rich 时回退旧命令读文本。
+      const rich = await api.clipboardLocalGetRich().catch(() => null);
+      if (rich && hasClipPayload(rich)) {
+        const ok = await api.peerClipboardSetRich(id, rich).catch(() => false);
+        if (!ok && rich.text) {
+          // 旧被控端 / 富格式发送失败：落回纯文本旧命令。
+          await api.peerClipboardSet(id, rich.text);
+        } else if (!ok) {
+          throw new Error(T('err.peerClipboardWrite'));
+        }
+      } else {
+        const text = await api.clipboardLocalGet();
+        await api.peerClipboardSet(id, text);
+      }
       showToast(T('rd.clipPushed'));
     } catch (e) {
       showToast(clipError(e));
@@ -808,6 +888,7 @@ export function RemoteView() {
       data-screen-stream-width={st?.stream?.width ?? 0}
       data-screen-stream-height={st?.stream?.height ?? 0}
       data-audio-state={audioOn ? 'on' : 'off'}
+      data-audio-mic={micOn ? '1' : '0'}
       data-audio-decoded={audioStats.decoded}
       data-audio-peak={audioStats.peak.toFixed(3)}
       data-audio-rate={audioStats.rate}
@@ -990,6 +1071,13 @@ export function RemoteView() {
             >
               {muted ? T('rd.unmute') : T('rd.mute')}
             </button>
+            <button
+              className={'tbtn' + (micOn ? ' on' : '')}
+              data-audio-mic-toggle
+              onClick={() => void toggleMic()}
+            >
+              {T('rd.mic')}
+            </button>
           </>
         )}
         {!allowInput && st?.auth?.token && st.auth.inputSupported !== false && (
@@ -1074,6 +1162,11 @@ export function RemoteView() {
             />
           )}
         </div>
+        {captureWarn && (
+          <div className="rv-capture-warn" data-capture-state={captureStateNow}>
+            {captureWarn}
+          </div>
+        )}
         {error && <div className="rv-error">{error}</div>}
         {!st?.frame && !error && <div className="rv-waiting">{T('rd.waitingHint')}</div>}
         {noFrame && !st?.frame && !error && (

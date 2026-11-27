@@ -72,9 +72,10 @@ windows = { version = "0.62", features = [
   # 远程桌面 P1 采集/编码（examples/peer_spike.rs 先行验证）：
   "Win32_System_Com",           # CoInitializeEx
   "Win32_System_Com_StructuredStorage", # CreateStreamOnHGlobal（GDI+ 内存 JPEG）
-  "Win32_System_DataExchange",  # 剪贴板（CF_UNICODETEXT）
+  "Win32_System_Threading",     # CreateEventW/WaitForSingleObject（事件驱动音频采集）
+  "Win32_System_DataExchange",  # 剪贴板（文本/HTML/RTF/PNG/DIB）
   "Win32_System_Memory",        # GlobalAlloc（剪贴板写入）
-  "Win32_System_Ole",           # CF_UNICODETEXT / VARIANT
+  "Win32_System_Ole",           # 剪贴板格式常量 / VARIANT
   "Win32_System_Variant",       # ICodecAPI 参数（VARIANT）
   "Win32_Media_MediaFoundation", # H.264 编码（MFT）
   "Win32_Media_Audio",          # WASAPI loopback 采集
@@ -83,6 +84,9 @@ windows = { version = "0.62", features = [
   "Graphics_DirectX_Direct3D11",# IDirect3DDevice / IDirect3DSurface
   "Win32_System_WinRT_Graphics_Capture", # GraphicsCaptureItemInterop
   "Win32_System_WinRT_Direct3D11",       # IDirect3DDxgiInterfaceAccess
+  "Win32_System_StationsAndDesktops",    # OpenInputDesktop（安全桌面探测）
+  "Win32_System_Registry",               # 读 CurrentBuildNumber（编码器诊断里的系统 build）
+  "Win32_UI_Shell",                      # SHQueryUserNotificationState（全屏 D3D 探测）
   "Win32_Graphics_Dxgi",        # IDXGIOutput1::DuplicateOutput
   "Win32_Graphics_Dxgi_Common", # DXGI_FORMAT / SAMPLE_DESC
   "Win32_Graphics_Gdi",         # DXGI_OUTPUT_DESC.Monitor（HMONITOR）→ CreateForMonitor

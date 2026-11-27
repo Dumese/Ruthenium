@@ -2,7 +2,13 @@
 //
 // 为什么不进 zustand：JPEG/H.264 帧（base64）体量大且高频，塞进全局 store 会触发整棵树
 // 重渲染；这里只通知「这个 session 有新帧」，绘制端按 codec 自己解码并节流。
-import type { CursorShapeInfo, MonitorInfo, ScreenFrame, WindowInfo } from '../../ipc/commands';
+import type {
+  CaptureStateKind,
+  CursorShapeInfo,
+  MonitorInfo,
+  ScreenFrame,
+  WindowInfo,
+} from '../../ipc/commands';
 
 export interface AudioStats {
   decoded: number;
@@ -69,6 +75,8 @@ export interface ScreenState {
   windows: WindowInfo[];
   /** 当前采集源 */
   source: { source: 'desktop' | 'window'; title?: string | null; reason?: string | null };
+  /** 服务端下发的采集健康状态（只在变化时更新；旧版对端不会下发） */
+  captureState: { state: CaptureStateKind; detail: string } | null;
 }
 
 const states = new Map<string, ScreenState>();
@@ -93,6 +101,7 @@ function ensure(id: string): ScreenState {
       cursor: null,
       windows: [],
       source: { source: 'desktop' },
+      captureState: null,
     };
     states.set(id, s);
   }
@@ -179,6 +188,9 @@ export function pushScreen(f: ScreenFrame): void {
       break;
     case 'source':
       s.source = { source: f.source, title: f.title, reason: f.reason };
+      break;
+    case 'captureState':
+      s.captureState = { state: f.state, detail: f.detail };
       break;
     case 'stream':
       s.stream = {

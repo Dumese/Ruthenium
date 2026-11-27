@@ -12,6 +12,7 @@ pub mod client;
 
 pub mod audio;
 pub mod audit;
+pub mod capture_state;
 pub mod clipboard;
 pub mod control;
 pub mod discovery;

@@ -87,6 +87,10 @@ pub enum AppError {
     #[serde(rename = "E_PEER_INBOX_INVALID")]
     #[error("收到的配置无效: {0}")]
     EPeerInboxInvalid(String),
+    /// 后台任务失败等内部错误（前端无专门文案时按未知错误展示）。
+    #[serde(rename = "E_INTERNAL")]
+    #[error("内部错误: {0}")]
+    EInternal(String),
 }
 
 impl From<std::io::Error> for AppError {
