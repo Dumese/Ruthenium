@@ -341,7 +341,10 @@ mod imp {
         }
     }
 
-    /// 逐级尝试：硬件（按 LUID）→ 软件 → 通用；激活或配置失败都换下一个。
+    /// 逐级尝试：硬件（按 LUID）→ 软件；激活或配置失败都换下一个。
+    ///
+    /// 不再单独枚举「通用」档：按文档，不带类别标志时默认就是
+    /// `SYNCMFT`，与软件档完全重复，只会多激活一遍。
     fn activate_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> EncoderResult<Backend> {
         let mut candidates: Vec<(&'static str, IMFActivate)> = Vec::new();
         for activate in hardware_activates() {
@@ -349,9 +352,6 @@ mod imp {
         }
         for activate in enum_encoders(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER) {
             candidates.push(("软件", activate));
-        }
-        for activate in enum_encoders(MFT_ENUM_FLAG_SORTANDFILTER) {
-            candidates.push(("通用", activate));
         }
         let mut last = String::from("系统中没有可用的 H.264 编码器（N 版需安装媒体功能包）");
         for (label, activate) in candidates {
@@ -799,6 +799,22 @@ mod imp {
         }
     }
 
+    /// 连续 150 次没有输出就按失败处理（调用方回退 JPEG）。
+    ///
+    /// 异步编码器在等待配额、等待输出时都可能返回空帧；持续无输出说明驱动
+    /// 已经卡住，继续等下去只会让查看端一直停在旧画面。
+    fn note_empty_output(b: &mut AsyncMft, empty: bool) -> EncoderResult<()> {
+        if empty {
+            b.empty_timeouts = b.empty_timeouts.saturating_add(1);
+            if b.empty_timeouts >= 150 {
+                return Err("编码器长时间没有输出".to_string());
+            }
+        } else {
+            b.empty_timeouts = 0;
+        }
+        Ok(())
+    }
+
     impl H264Encoder {
         pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> EncoderResult<Self> {
             ensure_mf()?;
@@ -988,6 +1004,7 @@ mod imp {
             }
             if !quota {
                 // 编码器暂时不接收输入：本帧交给采集端丢弃（下一帧再试）。
+                note_empty_output(b, frames.is_empty())?;
                 return Ok(frames);
             }
             let sample = self.make_input_sample()?;
@@ -1002,20 +1019,22 @@ mod imp {
                 Err(e) => return Err(format!("编码器接收帧失败: {e}")),
             }
             // 给硬件一个短窗口把刚提交的帧处理完；拿不到就下一次再收。
-            if let Ok(EventKind::HaveOutput) = b.wait_event(Duration::from_millis(2)) {
-                if let Some(frame) = self.drain_async_one(b)? {
-                    frames.push(frame);
+            match b.wait_event(Duration::from_millis(2)) {
+                Ok(EventKind::HaveOutput) => {
+                    if let Some(frame) = self.drain_async_one(b)? {
+                        frames.push(frame);
+                    }
                 }
+                // NeedInput 是输入配额，不能像其它事件一样丢弃：
+                // 部分驱动不会再补发，丢掉一个就少一个输入槽。
+                Ok(EventKind::NeedInput) => {
+                    b.need_input = b.need_input.saturating_add(1);
+                }
+                Ok(EventKind::Timeout) => {}
+                Err(e) => return Err(e),
             }
             self.drain_async_ready(b, &mut frames)?;
-            if frames.is_empty() {
-                b.empty_timeouts = b.empty_timeouts.saturating_add(1);
-                if b.empty_timeouts >= 150 {
-                    return Err("编码器长时间没有输出".to_string());
-                }
-            } else {
-                b.empty_timeouts = 0;
-            }
+            note_empty_output(b, frames.is_empty())?;
             Ok(frames)
         }
 
